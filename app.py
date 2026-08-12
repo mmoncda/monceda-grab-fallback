@@ -1,7 +1,9 @@
+import json
 import os
 import re
 import subprocess
 from urllib.parse import urlparse
+
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -9,12 +11,50 @@ app = Flask(__name__)
 URL_RE = re.compile(r"^https?://", re.I)
 
 
+def is_http_url(value):
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def choose_media(info):
+    # yt-dlp's selected media URL is normally here.
+    if is_http_url(info.get("url")):
+        return info.get("url"), info.get("ext") or "mp4"
+
+    # Some extractors return selected formats separately.
+    requested = info.get("requested_formats") or []
+    for item in requested:
+        if is_http_url(item.get("url")) and item.get("vcodec") not in (None, "none"):
+            return item["url"], item.get("ext") or "mp4"
+
+    # Final fallback: choose the best video-bearing format.
+    formats = info.get("formats") or []
+    candidates = [
+        item for item in formats
+        if is_http_url(item.get("url"))
+        and item.get("vcodec") not in (None, "none")
+    ]
+
+    if candidates:
+        candidates.sort(
+            key=lambda item: (
+                item.get("acodec") not in (None, "none"),
+                item.get("height") or 0,
+                item.get("tbr") or 0,
+            ),
+            reverse=True,
+        )
+        selected = candidates[0]
+        return selected["url"], selected.get("ext") or "mp4"
+
+    return None, None
+
+
 @app.get("/")
 def health():
     return jsonify({
         "status": "ok",
         "service": "monceda-grab-fallback",
-        "engine": "yt-dlp"
+        "engine": "yt-dlp",
     })
 
 
@@ -26,19 +66,18 @@ def extract():
     if not url or not URL_RE.match(url):
         return jsonify({
             "status": "error",
-            "error": "invalid_url"
+            "error": "invalid_url",
         }), 400
 
-    # Current fallback scope: public Instagram URLs only.
     try:
         host = re.sub(r"^www\.", "", urlparse(url).hostname or "")
     except Exception:
         host = ""
 
-    if host not in {"instagram.com"}:
+    if host != "instagram.com":
         return jsonify({
             "status": "error",
-            "error": "unsupported_host"
+            "error": "unsupported_host",
         }), 400
 
     cmd = [
@@ -46,9 +85,7 @@ def extract():
         "--no-playlist",
         "--no-download",
         "--no-warnings",
-        "--print", "%(id)s",
-        "--print", "%(ext)s",
-        "--print", "%(url)s",
+        "--dump-single-json",
         url,
     ]
 
@@ -63,31 +100,33 @@ def extract():
     except subprocess.TimeoutExpired:
         return jsonify({
             "status": "error",
-            "error": "extract_timeout"
+            "error": "extract_timeout",
         }), 504
 
     if result.returncode != 0:
         return jsonify({
             "status": "error",
             "error": "extract_failed",
-            "detail": result.stderr[-1000:]
+            "detail": result.stderr[-1000:],
         }), 422
 
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-    if len(lines) < 3:
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
         return jsonify({
             "status": "error",
-            "error": "no_media"
-        }), 422
+            "error": "invalid_extractor_response",
+        }), 502
 
-    media_id, ext, media_url = lines[-3:]
+    media_url, ext = choose_media(info)
 
-    if not media_url.startswith(("http://", "https://")):
+    if not media_url:
         return jsonify({
             "status": "error",
-            "error": "invalid_media_url"
+            "error": "no_video_media",
         }), 422
+
+    media_id = str(info.get("id") or "media")
 
     return jsonify({
         "status": "ok",
@@ -95,7 +134,7 @@ def extract():
         "id": media_id,
         "ext": ext,
         "filename": f"instagram_{media_id}.{ext}",
-        "url": media_url
+        "url": media_url,
     })
 
 
