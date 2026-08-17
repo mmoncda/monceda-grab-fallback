@@ -316,7 +316,7 @@ def instagram_normalize():
         "-loglevel",
         "error",
         "-threads",
-        "1",
+        "2",
         "-i",
         media_url,
     ]
