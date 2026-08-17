@@ -2,9 +2,11 @@ import json
 import os
 import re
 import subprocess
+import tempfile
+import shutil
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -75,6 +77,167 @@ def debug_impersonation():
         "stdout": result.stdout,
         "stderr": result.stderr,
     })
+
+
+@app.post("/instagram/download")
+def instagram_download():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not url or not URL_RE.match(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_url",
+        }), 400
+
+    try:
+        host = re.sub(
+            r"^www\.",
+            "",
+            urlparse(url).hostname or "",
+        )
+    except Exception:
+        host = ""
+
+    if host != "instagram.com":
+        return jsonify({
+            "status": "error",
+            "error": "unsupported_host",
+        }), 400
+
+    temp_dir = tempfile.mkdtemp(
+        prefix="monceda-instagram-"
+    )
+
+    output_template = os.path.join(
+        temp_dir,
+        "media.%(ext)s",
+    )
+
+    try:
+        #
+        # IMPORTANT:
+        # No transcoding here.
+        #
+        # Select H.264 video + AAC/M4A audio and let
+        # yt-dlp/FFmpeg MERGE them into one MP4.
+        #
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "-f",
+            (
+                "bestvideo[vcodec^=avc1]+"
+                "bestaudio[acodec^=mp4a]/"
+                "bestvideo[vcodec^=avc1]+"
+                "bestaudio[ext=m4a]/"
+                "best[ext=mp4][vcodec^=avc1]"
+            ),
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            output_template,
+            url,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            return jsonify({
+                "status": "error",
+                "error": "instagram_download_failed",
+                "detail": result.stderr[-1200:],
+            }), 422
+
+        candidates = []
+
+        for name in os.listdir(temp_dir):
+            path = os.path.join(temp_dir, name)
+
+            if (
+                os.path.isfile(path)
+                and name.lower().endswith(".mp4")
+            ):
+                candidates.append(path)
+
+        if not candidates:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            return jsonify({
+                "status": "error",
+                "error": "instagram_mp4_missing",
+            }), 422
+
+        final_path = max(
+            candidates,
+            key=os.path.getsize,
+        )
+
+        response = send_file(
+            final_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="instagram-video.mp4",
+            conditional=False,
+        )
+
+        response.headers["Cache-Control"] = (
+            "private, no-store"
+        )
+        response.headers[
+            "X-Monceda-Instagram"
+        ] = "h264-aac-merged"
+
+        response.call_on_close(
+            lambda: shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+        )
+
+        return response
+
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_download_timeout",
+        }), 504
+
+    except Exception as error:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        app.logger.exception(
+            "Instagram merged download failed"
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_download_failed",
+            "detail": str(error),
+        }), 500
 
 
 @app.post("/extract")
