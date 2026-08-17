@@ -339,17 +339,14 @@ def instagram_normalize():
         ]
 
     cmd += [
-        "-vf",
-        "scale=-2:720",
-
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        "superfast",
         "-tune",
         "zerolatency",
         "-crf",
-        "28",
+        "20",
         "-pix_fmt",
         "yuv420p",
         "-threads",
