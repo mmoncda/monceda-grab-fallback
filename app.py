@@ -425,6 +425,9 @@ def extract():
 
     supported_hosts = {
         "instagram.com",
+        "tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
         "bsky.app",
         "dailymotion.com",
         "dai.ly",
@@ -500,6 +503,15 @@ def extract():
         "ext": ext,
         "filename": f"{host.replace('.', '_')}_{media_id}.{ext}",
         "url": media_url,
+        "title": str(info.get("title") or "").strip(),
+        "author": str(
+            info.get("uploader")
+            or info.get("channel")
+            or info.get("creator")
+            or ""
+        ).strip(),
+        "duration": info.get("duration"),
+        "upload_date": str(info.get("upload_date") or "").strip(),
     }
 
     if audio_url:
