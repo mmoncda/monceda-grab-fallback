@@ -15,37 +15,57 @@ def is_http_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
+def is_h264(value):
+    codec = str(value or "").lower()
+    return (
+        codec.startswith("avc1")
+        or codec.startswith("avc")
+        or "h264" in codec
+        or "h.264" in codec
+    )
+
+
 def choose_media(info):
-    # yt-dlp's selected media URL is normally here.
-    if is_http_url(info.get("url")):
-        return info.get("url"), info.get("ext") or "mp4"
-
-    # Some extractors return selected formats separately.
-    requested = info.get("requested_formats") or []
-    for item in requested:
-        if is_http_url(item.get("url")) and item.get("vcodec") not in (None, "none"):
-            return item["url"], item.get("ext") or "mp4"
-
-    # Final fallback: choose the best video-bearing format.
     formats = info.get("formats") or []
-    candidates = [
+
+    # Prefer one self-contained file that already has
+    # BOTH video and audio. This avoids returning DASH
+    # video-only streams such as Instagram VP9 renditions.
+    combined = [
         item for item in formats
         if is_http_url(item.get("url"))
         and item.get("vcodec") not in (None, "none")
+        and item.get("acodec") not in (None, "none")
     ]
 
-    if candidates:
-        candidates.sort(
+    if combined:
+        combined.sort(
             key=lambda item: (
-                item.get("acodec") not in (None, "none"),
+                is_h264(item.get("vcodec")),
+                str(item.get("ext") or "").lower() == "mp4",
                 item.get("height") or 0,
                 item.get("tbr") or 0,
             ),
             reverse=True,
         )
-        selected = candidates[0]
-        return selected["url"], selected.get("ext") or "mp4"
 
+        selected = combined[0]
+
+        return (
+            selected["url"],
+            selected.get("ext") or "mp4",
+        )
+
+    # If yt-dlp itself selected a combined stream, use it.
+    if (
+        is_http_url(info.get("url"))
+        and info.get("vcodec") not in (None, "none")
+        and info.get("acodec") not in (None, "none")
+    ):
+        return info.get("url"), info.get("ext") or "mp4"
+
+    # Do NOT return a video-only stream as a normal downloadable
+    # video. That was the source of the broken Instagram file.
     return None, None
 
 
