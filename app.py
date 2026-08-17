@@ -15,38 +15,101 @@ def is_http_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
+def is_h264_codec(value):
+    codec = str(value or "").lower()
+    return (
+        codec.startswith("avc1")
+        or codec.startswith("avc")
+        or "h264" in codec
+        or "h.264" in codec
+    )
+
+
 def choose_media(info):
-    # yt-dlp's selected media URL is normally here.
-    if is_http_url(info.get("url")):
-        return info.get("url"), info.get("ext") or "mp4"
+    """
+    Prefer a broadly compatible H.264/AVC MP4 rendition when yt-dlp
+    exposes one. Fall back to the extractor's selected URL only when
+    no better compatible option is available.
+    """
 
-    # Some extractors return selected formats separately.
-    requested = info.get("requested_formats") or []
-    for item in requested:
-        if is_http_url(item.get("url")) and item.get("vcodec") not in (None, "none"):
-            return item["url"], item.get("ext") or "mp4"
-
-    # Final fallback: choose the best video-bearing format.
     formats = info.get("formats") or []
-    candidates = [
+
+    video_candidates = [
         item for item in formats
         if is_http_url(item.get("url"))
         and item.get("vcodec") not in (None, "none")
     ]
 
-    if candidates:
-        candidates.sort(
+    if video_candidates:
+        def score(item):
+            ext = str(item.get("ext") or "").lower()
+            vcodec = str(item.get("vcodec") or "").lower()
+            acodec = item.get("acodec")
+
+            has_audio = acodec not in (None, "none")
+            is_mp4 = ext in ("mp4", "m4v", "mov")
+            h264 = is_h264_codec(vcodec)
+
+            return (
+                h264,
+                is_mp4,
+                has_audio,
+                item.get("height") or 0,
+                item.get("tbr") or 0,
+            )
+
+        video_candidates.sort(
+            key=score,
+            reverse=True,
+        )
+
+        selected = video_candidates[0]
+
+        return (
+            selected["url"],
+            selected.get("ext") or "mp4",
+            selected.get("vcodec"),
+            selected.get("acodec"),
+        )
+
+    requested = info.get("requested_formats") or []
+
+    requested_video = [
+        item for item in requested
+        if is_http_url(item.get("url"))
+        and item.get("vcodec") not in (None, "none")
+    ]
+
+    if requested_video:
+        requested_video.sort(
             key=lambda item: (
+                is_h264_codec(item.get("vcodec")),
+                str(item.get("ext") or "").lower() == "mp4",
                 item.get("acodec") not in (None, "none"),
                 item.get("height") or 0,
                 item.get("tbr") or 0,
             ),
             reverse=True,
         )
-        selected = candidates[0]
-        return selected["url"], selected.get("ext") or "mp4"
 
-    return None, None
+        selected = requested_video[0]
+
+        return (
+            selected["url"],
+            selected.get("ext") or "mp4",
+            selected.get("vcodec"),
+            selected.get("acodec"),
+        )
+
+    if is_http_url(info.get("url")):
+        return (
+            info.get("url"),
+            info.get("ext") or "mp4",
+            info.get("vcodec"),
+            info.get("acodec"),
+        )
+
+    return None, None, None, None
 
 
 @app.get("/")
@@ -55,7 +118,7 @@ def health():
         "status": "ok",
         "service": "monceda-grab-fallback",
         "engine": "yt-dlp",
-        "build": "bilibili-tv-454bcf1",
+        "build": "h264-preferred-v1",
     })
 
 
@@ -147,7 +210,7 @@ def extract():
             "error": "invalid_extractor_response",
         }), 502
 
-    media_url, ext = choose_media(info)
+    media_url, ext, vcodec, acodec = choose_media(info)
 
     if not media_url:
         return jsonify({
@@ -162,6 +225,8 @@ def extract():
         "engine": "yt-dlp",
         "id": media_id,
         "ext": ext,
+        "vcodec": vcodec,
+        "acodec": acodec,
         "filename": f"{host.replace('.', '_')}_{media_id}.{ext}",
         "url": media_url,
     })
