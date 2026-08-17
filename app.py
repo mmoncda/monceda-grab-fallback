@@ -2,10 +2,9 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -119,7 +118,7 @@ def health():
         "status": "ok",
         "service": "monceda-grab-fallback",
         "engine": "yt-dlp",
-        "build": "normalized-h264-aac-v1",
+        "build": "h264-preferred-v1",
     })
 
 
@@ -217,227 +216,6 @@ def debug_formats():
         },
         "formats": formats,
     })
-
-
-@app.post("/download")
-def download_media():
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-
-    if not url or not URL_RE.match(url):
-        return jsonify({
-            "status": "error",
-            "error": "invalid_url",
-        }), 400
-
-    try:
-        host = re.sub(
-            r"^www\.",
-            "",
-            urlparse(url).hostname or "",
-        )
-    except Exception:
-        host = ""
-
-    supported_hosts = {
-        "instagram.com",
-        "bsky.app",
-        "dailymotion.com",
-        "dai.ly",
-        "vimeo.com",
-        "player.vimeo.com",
-        "bilibili.tv",
-    }
-
-    if host not in supported_hosts:
-        return jsonify({
-            "status": "error",
-            "error": "unsupported_host",
-        }), 400
-
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="monceda-grab-"
-        ) as temp_dir:
-            output = os.path.join(
-                temp_dir,
-                "media.mp4",
-            )
-
-            cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "--no-warnings",
-
-                # Prefer a directly compatible H.264/AAC stream.
-                # If unavailable, yt-dlp/ffmpeg obtains the best
-                # available streams and converts the final file.
-                "-f",
-                (
-                    "best[vcodec^=avc1][acodec^=mp4a]/"
-                    "bestvideo[vcodec^=avc1]+"
-                    "bestaudio[acodec^=mp4a]/"
-                    "bestvideo+bestaudio/best"
-                ),
-
-                "--merge-output-format",
-                "mp4",
-                "-o",
-                output,
-                url,
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-
-            if (
-                result.returncode != 0
-                or not os.path.isfile(output)
-            ):
-                return jsonify({
-                    "status": "error",
-                    "error": "download_failed",
-                    "detail": result.stderr[-1200:],
-                }), 422
-
-            probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=codec_name",
-                    "-of",
-                    "default=nw=1:nk=1",
-                    output,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-
-            video_codec = probe.stdout.strip().lower()
-
-            audio_probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "a:0",
-                    "-show_entries",
-                    "stream=codec_name",
-                    "-of",
-                    "default=nw=1:nk=1",
-                    output,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-
-            audio_codec = (
-                audio_probe.stdout.strip().lower()
-            )
-
-            final_path = output
-
-            if (
-                video_codec != "h264"
-                or (
-                    audio_codec
-                    and audio_codec != "aac"
-                )
-            ):
-                normalized = os.path.join(
-                    temp_dir,
-                    "normalized.mp4",
-                )
-
-                ffmpeg = subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        output,
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "0:a:0?",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-crf",
-                        "21",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-movflags",
-                        "+faststart",
-                        normalized,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    check=False,
-                )
-
-                if (
-                    ffmpeg.returncode != 0
-                    or not os.path.isfile(normalized)
-                ):
-                    return jsonify({
-                        "status": "error",
-                        "error": "normalize_failed",
-                        "detail": ffmpeg.stderr[-1200:],
-                    }), 500
-
-                final_path = normalized
-
-            #
-            # Read into memory before TemporaryDirectory exits.
-            # This avoids deleting the file while Flask is still
-            # streaming it.
-            #
-            with open(final_path, "rb") as media:
-                payload = media.read()
-
-            from io import BytesIO
-
-            response = send_file(
-                BytesIO(payload),
-                mimetype="video/mp4",
-                as_attachment=True,
-                download_name="monceda-grab-media.mp4",
-            )
-
-            response.headers["Cache-Control"] = (
-                "private, no-store"
-            )
-            response.headers[
-                "X-Monceda-Normalized"
-            ] = "h264-aac"
-
-            return response
-
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "status": "error",
-            "error": "processing_timeout",
-        }), 504
 
 
 @app.post("/extract")
