@@ -6,7 +6,7 @@ import tempfile
 import shutil
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -238,6 +238,119 @@ def instagram_download():
             "error": "instagram_download_failed",
             "detail": str(error),
         }), 500
+
+
+def is_instagram_media_url(value):
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+
+        return (
+            parsed.scheme == "https"
+            and (
+                host == "fbcdn.net"
+                or host.endswith(".fbcdn.net")
+            )
+        )
+    except Exception:
+        return False
+
+
+@app.post("/instagram/normalize")
+def instagram_normalize():
+    data = request.get_json(silent=True) or {}
+    media_url = str(data.get("url", "")).strip()
+
+    if not is_instagram_media_url(media_url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_media_url",
+        }), 400
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        media_url,
+
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+
+        "-vf",
+        "scale=-2:720",
+
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-crf",
+        "28",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+
+    def generate():
+        try:
+            while True:
+                chunk = process.stdout.read(256 * 1024)
+
+                if not chunk:
+                    break
+
+                yield chunk
+        finally:
+            if process.stdout:
+                process.stdout.close()
+
+            if process.poll() is None:
+                process.terminate()
+
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    response = Response(
+        generate(),
+        mimetype="video/mp4",
+        direct_passthrough=True,
+    )
+
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="instagram-video.mp4"'
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Monceda-Instagram"] = "h264-stream"
+
+    return response
 
 
 @app.post("/extract")
