@@ -350,7 +350,7 @@ def instagram_normalize():
         "-pix_fmt",
         "yuv420p",
         "-threads",
-        "1",
+        "2",
 
         "-c:a",
         "aac",
