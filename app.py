@@ -99,6 +99,7 @@ def extract():
         "dai.ly",
         "vimeo.com",
         "player.vimeo.com",
+        "bilibili.tv",
     }
 
     if host not in supported_hosts:
