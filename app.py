@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file, after_this_request
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -119,7 +119,7 @@ def health():
         "status": "ok",
         "service": "monceda-grab-fallback",
         "engine": "yt-dlp",
-        "build": "normalized-h264-aac-v2",
+        "build": "normalized-h264-aac-v1",
     })
 
 
@@ -408,34 +408,20 @@ def download_media():
                 final_path = normalized
 
             #
-            # Move the final media outside TemporaryDirectory so Flask
-            # can stream it from disk instead of loading the entire
-            # video into the Render worker's memory.
+            # Read into memory before TemporaryDirectory exits.
+            # This avoids deleting the file while Flask is still
+            # streaming it.
             #
-            import shutil
+            with open(final_path, "rb") as media:
+                payload = media.read()
 
-            fd, response_path = tempfile.mkstemp(
-                prefix="monceda-grab-response-",
-                suffix=".mp4",
-            )
-            os.close(fd)
-
-            shutil.move(final_path, response_path)
-
-            @after_this_request
-            def cleanup_response_file(response):
-                try:
-                    os.remove(response_path)
-                except OSError:
-                    pass
-                return response
+            from io import BytesIO
 
             response = send_file(
-                response_path,
+                BytesIO(payload),
                 mimetype="video/mp4",
                 as_attachment=True,
                 download_name="monceda-grab-media.mp4",
-                conditional=False,
             )
 
             response.headers["Cache-Control"] = (
