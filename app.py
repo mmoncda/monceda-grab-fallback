@@ -140,6 +140,84 @@ def debug_impersonation():
     })
 
 
+@app.post("/debug/formats")
+def debug_formats():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not url or not URL_RE.match(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_url",
+        }), 400
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-download",
+        "--no-warnings",
+        "--dump-single-json",
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "status": "error",
+            "error": "extract_timeout",
+        }), 504
+
+    if result.returncode != 0:
+        return jsonify({
+            "status": "error",
+            "error": "extract_failed",
+            "detail": result.stderr[-1000:],
+        }), 422
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return jsonify({
+            "status": "error",
+            "error": "invalid_extractor_response",
+        }), 502
+
+    formats = []
+
+    for item in info.get("formats") or []:
+        formats.append({
+            "format_id": item.get("format_id"),
+            "ext": item.get("ext"),
+            "vcodec": item.get("vcodec"),
+            "acodec": item.get("acodec"),
+            "width": item.get("width"),
+            "height": item.get("height"),
+            "fps": item.get("fps"),
+            "tbr": item.get("tbr"),
+            "protocol": item.get("protocol"),
+            "has_url": is_http_url(item.get("url")),
+        })
+
+    return jsonify({
+        "status": "ok",
+        "id": info.get("id"),
+        "selected": {
+            "format_id": info.get("format_id"),
+            "ext": info.get("ext"),
+            "vcodec": info.get("vcodec"),
+            "acodec": info.get("acodec"),
+        },
+        "formats": formats,
+    })
+
+
 @app.post("/extract")
 def extract():
     data = request.get_json(silent=True) or {}
