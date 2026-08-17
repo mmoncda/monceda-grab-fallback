@@ -74,7 +74,14 @@ def extract():
     except Exception:
         host = ""
 
-    if host != "instagram.com":
+    supported_hosts = {
+        "instagram.com",
+        "bsky.app",
+        "dailymotion.com",
+        "dai.ly",
+    }
+
+    if host not in supported_hosts:
         return jsonify({
             "status": "error",
             "error": "unsupported_host",
@@ -133,7 +140,7 @@ def extract():
         "engine": "yt-dlp",
         "id": media_id,
         "ext": ext,
-        "filename": f"instagram_{media_id}.{ext}",
+        "filename": f"{host.replace('.', '_')}_{media_id}.{ext}",
         "url": media_url,
     })
 
