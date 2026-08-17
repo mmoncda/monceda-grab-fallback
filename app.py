@@ -58,6 +58,24 @@ def health():
     })
 
 
+@app.get("/debug/impersonation")
+def debug_impersonation():
+    result = subprocess.run(
+        ["yt-dlp", "--list-impersonate-targets"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    return jsonify({
+        "status": "ok" if result.returncode == 0 else "error",
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    })
+
+
 @app.post("/extract")
 def extract():
     data = request.get_json(silent=True) or {}
