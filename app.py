@@ -55,6 +55,7 @@ def health():
         "status": "ok",
         "service": "monceda-grab-fallback",
         "engine": "yt-dlp",
+        "build": "bilibili-tv-454bcf1",
     })
 
 
