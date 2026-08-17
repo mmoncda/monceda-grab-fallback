@@ -109,40 +109,38 @@ def instagram_download():
         prefix="monceda-instagram-"
     )
 
-    output_template = os.path.join(
+    source_template = os.path.join(
         temp_dir,
-        "media.%(ext)s",
+        "source.%(ext)s",
+    )
+
+    source_path = None
+    final_path = os.path.join(
+        temp_dir,
+        "instagram-final.mp4",
     )
 
     try:
         #
-        # IMPORTANT:
-        # No transcoding here.
+        # Download the media Instagram actually provides.
+        # Do not require H264 here because this Reel may only
+        # expose VP9.
         #
-        # Select H.264 video + AAC/M4A audio and let
-        # yt-dlp/FFmpeg MERGE them into one MP4.
-        #
-        cmd = [
+        download_cmd = [
             "yt-dlp",
             "--no-playlist",
             "--no-warnings",
             "-f",
-            (
-                "bestvideo[vcodec^=avc1]+"
-                "bestaudio[acodec^=mp4a]/"
-                "bestvideo[vcodec^=avc1]+"
-                "bestaudio[ext=m4a]/"
-                "best[ext=mp4][vcodec^=avc1]"
-            ),
+            "bestvideo+bestaudio/best",
             "--merge-output-format",
-            "mp4",
+            "mkv",
             "-o",
-            output_template,
+            source_template,
             url,
         ]
 
         result = subprocess.run(
-            cmd,
+            download_cmd,
             capture_output=True,
             text=True,
             timeout=120,
@@ -150,43 +148,79 @@ def instagram_download():
         )
 
         if result.returncode != 0:
-            shutil.rmtree(
-                temp_dir,
-                ignore_errors=True,
-            )
-
             return jsonify({
                 "status": "error",
                 "error": "instagram_download_failed",
-                "detail": result.stderr[-1200:],
+                "detail": result.stderr[-1600:],
             }), 422
 
-        candidates = []
-
-        for name in os.listdir(temp_dir):
-            path = os.path.join(temp_dir, name)
-
-            if (
-                os.path.isfile(path)
-                and name.lower().endswith(".mp4")
-            ):
-                candidates.append(path)
+        candidates = [
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if os.path.isfile(
+                os.path.join(temp_dir, name)
+            )
+        ]
 
         if not candidates:
-            shutil.rmtree(
-                temp_dir,
-                ignore_errors=True,
-            )
-
             return jsonify({
                 "status": "error",
-                "error": "instagram_mp4_missing",
+                "error": "instagram_source_missing",
             }), 422
 
-        final_path = max(
+        source_path = max(
             candidates,
             key=os.path.getsize,
         )
+
+        #
+        # Produce a normal QuickTime-compatible MP4:
+        # H.264 video + AAC audio.
+        #
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            source_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            final_path,
+        ]
+
+        converted = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+        if (
+            converted.returncode != 0
+            or not os.path.exists(final_path)
+            or os.path.getsize(final_path) == 0
+        ):
+            return jsonify({
+                "status": "error",
+                "error": "instagram_conversion_failed",
+                "detail": converted.stderr[-2000:],
+            }), 502
 
         response = send_file(
             final_path,
@@ -201,7 +235,7 @@ def instagram_download():
         )
         response.headers[
             "X-Monceda-Instagram"
-        ] = "h264-aac-merged"
+        ] = "h264-aac"
 
         response.call_on_close(
             lambda: shutil.rmtree(
@@ -220,7 +254,7 @@ def instagram_download():
 
         return jsonify({
             "status": "error",
-            "error": "instagram_download_timeout",
+            "error": "instagram_processing_timeout",
         }), 504
 
     except Exception as error:
@@ -230,12 +264,12 @@ def instagram_download():
         )
 
         app.logger.exception(
-            "Instagram merged download failed"
+            "Instagram processing failed"
         )
 
         return jsonify({
             "status": "error",
-            "error": "instagram_download_failed",
+            "error": "instagram_processing_failed",
             "detail": str(error),
         }), 500
 
