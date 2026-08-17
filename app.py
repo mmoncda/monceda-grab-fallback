@@ -51,6 +51,42 @@ def choose_media(info):
     return None, None
 
 
+def choose_audio(info):
+    # First prefer an explicitly requested audio stream.
+    requested = info.get("requested_formats") or []
+
+    audio_candidates = [
+        item for item in requested
+        if is_http_url(item.get("url"))
+        and item.get("acodec") not in (None, "none")
+        and item.get("vcodec") in (None, "none")
+    ]
+
+    # Otherwise inspect all available formats.
+    if not audio_candidates:
+        formats = info.get("formats") or []
+
+        audio_candidates = [
+            item for item in formats
+            if is_http_url(item.get("url"))
+            and item.get("acodec") not in (None, "none")
+            and item.get("vcodec") in (None, "none")
+        ]
+
+    if not audio_candidates:
+        return None
+
+    audio_candidates.sort(
+        key=lambda item: (
+            item.get("abr") or 0,
+            item.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+
+    return audio_candidates[0]["url"]
+
+
 @app.get("/")
 def health():
     return jsonify({
@@ -260,11 +296,18 @@ def is_instagram_media_url(value):
 def instagram_normalize():
     data = request.get_json(silent=True) or {}
     media_url = str(data.get("url", "")).strip()
+    audio_url = str(data.get("audio_url", "")).strip()
 
     if not is_instagram_media_url(media_url):
         return jsonify({
             "status": "error",
             "error": "invalid_media_url",
+        }), 400
+
+    if audio_url and not is_instagram_media_url(audio_url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_audio_url",
         }), 400
 
     cmd = [
@@ -276,12 +319,26 @@ def instagram_normalize():
         "1",
         "-i",
         media_url,
+    ]
 
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
+    if audio_url:
+        cmd += [
+            "-i",
+            audio_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+    else:
+        cmd += [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+        ]
 
+    cmd += [
         "-vf",
         "scale=-2:720",
 
@@ -433,14 +490,25 @@ def extract():
 
     media_id = str(info.get("id") or "media")
 
-    return jsonify({
+    audio_url = (
+        choose_audio(info)
+        if host == "instagram.com"
+        else None
+    )
+
+    response = {
         "status": "ok",
         "engine": "yt-dlp",
         "id": media_id,
         "ext": ext,
         "filename": f"{host.replace('.', '_')}_{media_id}.{ext}",
         "url": media_url,
-    })
+    }
+
+    if audio_url:
+        response["audio_url"] = audio_url
+
+    return jsonify(response)
 
 
 if __name__ == "__main__":
