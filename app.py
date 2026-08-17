@@ -97,6 +97,8 @@ def extract():
         "bsky.app",
         "dailymotion.com",
         "dai.ly",
+        "vimeo.com",
+        "player.vimeo.com",
     }
 
     if host not in supported_hosts:
