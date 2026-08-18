@@ -296,6 +296,76 @@ def instagram_download():
             key=os.path.getsize,
         )
 
+        # Instagram Stories must be normalized for Apple/QuickTime.
+        # A file being .mp4 is not enough: force H.264 + AAC,
+        # yuv420p and a standard non-fragmented MP4 layout.
+        if is_instagram_story_url(url):
+            compatible_path = os.path.join(
+                temp_dir,
+                "instagram-story-compatible.mp4",
+            )
+
+            transcode_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                final_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-profile:v",
+                "high",
+                "-level",
+                "4.1",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ar",
+                "48000",
+                "-movflags",
+                "+faststart",
+                compatible_path,
+            ]
+
+            transcode_result = subprocess.run(
+                transcode_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+
+            if (
+                transcode_result.returncode != 0
+                or not os.path.isfile(compatible_path)
+                or os.path.getsize(compatible_path) == 0
+            ):
+                shutil.rmtree(
+                    temp_dir,
+                    ignore_errors=True,
+                )
+
+                return jsonify({
+                    "status": "error",
+                    "error": "instagram_story_transcode_failed",
+                    "detail": transcode_result.stderr[-1200:],
+                }), 422
+
+            final_path = compatible_path
+
         response = send_file(
             final_path,
             mimetype="video/mp4",
