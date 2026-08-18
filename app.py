@@ -67,6 +67,9 @@ def is_http_url(value):
 
 
 def choose_media(info):
+    if not isinstance(info, dict):
+        return None, None
+
     # yt-dlp's selected media URL is normally here.
     if is_http_url(info.get("url")):
         return info.get("url"), info.get("ext") or "mp4"
@@ -101,6 +104,9 @@ def choose_media(info):
 
 
 def choose_audio(info):
+    if not isinstance(info, dict):
+        return None
+
     # First prefer an explicitly requested audio stream.
     requested = info.get("requested_formats") or []
 
@@ -271,16 +277,36 @@ def instagram_download():
 
         candidates = []
 
+        temp_entries = []
         for name in os.listdir(temp_dir):
             path = os.path.join(temp_dir, name)
 
-            if (
-                os.path.isfile(path)
-                and name.lower().endswith(".mp4")
-            ):
-                candidates.append(path)
+            if os.path.isfile(path):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = -1
+
+                temp_entries.append({
+                    "name": name,
+                    "size": size,
+                })
+
+                if name.lower().endswith(".mp4"):
+                    candidates.append(path)
 
         if not candidates:
+            print(
+                "INSTAGRAM DOWNLOAD DEBUG:",
+                {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout[-3000:],
+                    "stderr": result.stderr[-3000:],
+                    "files": temp_entries,
+                },
+                flush=True,
+            )
+
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True,
@@ -289,6 +315,12 @@ def instagram_download():
             return jsonify({
                 "status": "error",
                 "error": "instagram_mp4_missing",
+                "debug": {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout[-2000:],
+                    "stderr": result.stderr[-2000:],
+                    "files": temp_entries,
+                },
             }), 422
 
         final_path = max(
