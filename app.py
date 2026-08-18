@@ -10,7 +10,171 @@ from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
 
+
 URL_RE = re.compile(r"^https?://", re.I)
+
+INSTAGRAM_COOKIE_SECRET_PATH = os.environ.get(
+    "INSTAGRAM_COOKIE_SECRET_PATH",
+    "/secrets/instagram/cookies.txt",
+)
+
+
+def is_instagram_story_url(value):
+    try:
+        parsed = urlparse(value)
+        host = re.sub(
+            r"^www\.",
+            "",
+            (parsed.hostname or "").lower(),
+        )
+
+        return (
+            parsed.scheme == "https"
+            and host == "instagram.com"
+            and re.match(
+                r"^/stories/[^/]+/\d+/?$",
+                parsed.path,
+                re.I,
+            )
+            is not None
+        )
+    except Exception:
+        return False
+
+
+def copy_instagram_story_cookies(destination_dir=None):
+    source = INSTAGRAM_COOKIE_SECRET_PATH
+
+    if not os.path.isfile(source):
+        return None
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix="monceda-instagram-story-cookies-",
+        suffix=".txt",
+        dir=destination_dir,
+    )
+    os.close(fd)
+
+    shutil.copyfile(source, temp_path)
+    os.chmod(temp_path, 0o600)
+
+    return temp_path
+
+
+def select_instagram_story_info(info, url):
+    if not isinstance(info, dict):
+        return None
+
+    entries = info.get("entries")
+
+    if not isinstance(entries, list):
+        return info
+
+    story_id = ""
+
+    try:
+        parts = [
+            item
+            for item in urlparse(url).path.split("/")
+            if item
+        ]
+
+        if len(parts) >= 3:
+            story_id = parts[2]
+    except Exception:
+        story_id = ""
+
+    if story_id:
+        for entry in entries:
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("id") or "") == story_id
+            ):
+                return entry
+
+    for entry in entries:
+        if isinstance(entry, dict):
+            return entry
+
+    return None
+
+
+def extract_instagram_story_info(url):
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return (
+            None,
+            "instagram_story_auth_unavailable",
+            "",
+            503,
+        )
+
+    cmd = [
+        "yt-dlp",
+        "--cookies",
+        cookie_path,
+        "--no-playlist",
+        "--no-download",
+        "--no-warnings",
+        "--dump-single-json",
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            None,
+            "instagram_story_extract_timeout",
+            "",
+            504,
+        )
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        return (
+            None,
+            "instagram_story_extract_failed",
+            result.stderr[-1500:],
+            422,
+        )
+
+    try:
+        root_info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return (
+            None,
+            "instagram_story_invalid_response",
+            "",
+            502,
+        )
+
+    info = select_instagram_story_info(
+        root_info,
+        url,
+    )
+
+    if not isinstance(info, dict):
+        return (
+            None,
+            "instagram_story_media_missing",
+            "",
+            422,
+        )
+
+    return info, None, "", 200
+
 
 
 def is_http_url(value):
@@ -294,6 +458,245 @@ def is_instagram_media_url(value):
         )
     except Exception:
         return False
+
+
+
+@app.post("/instagram/story/extract")
+def instagram_story_extract():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_instagram_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_instagram_story_url",
+        }), 400
+
+    info, error, detail, status_code = (
+        extract_instagram_story_info(url)
+    )
+
+    if error:
+        return jsonify({
+            "status": "error",
+            "error": error,
+            **({"detail": detail} if detail else {}),
+        }), status_code
+
+    media_url, ext = choose_media(info)
+    audio_url = choose_audio(info)
+
+    if (
+        not media_url
+        or not is_instagram_media_url(media_url)
+    ):
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_media_missing",
+        }), 422
+
+    if (
+        audio_url
+        and not is_instagram_media_url(audio_url)
+    ):
+        audio_url = None
+
+    media_id = str(info.get("id") or "story")
+
+    response = {
+        "status": "ok",
+        "engine": "yt-dlp",
+        "instagram_story": True,
+        "id": media_id,
+        "ext": ext or "mp4",
+        "filename": f"instagram_story_{media_id}.mp4",
+        "url": media_url,
+        "title": str(
+            info.get("title")
+            or "Instagram Story"
+        ).strip(),
+        "author": str(
+            info.get("uploader")
+            or info.get("channel")
+            or info.get("creator")
+            or ""
+        ).strip(),
+        "duration": info.get("duration"),
+        "upload_date": str(
+            info.get("upload_date") or ""
+        ).strip(),
+    }
+
+    if audio_url:
+        response["audio_url"] = audio_url
+
+    return jsonify(response)
+
+
+@app.post("/instagram/story/download")
+def instagram_story_download():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_instagram_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_instagram_story_url",
+        }), 400
+
+    info, error, detail, status_code = (
+        extract_instagram_story_info(url)
+    )
+
+    if error:
+        return jsonify({
+            "status": "error",
+            "error": error,
+            **({"detail": detail} if detail else {}),
+        }), status_code
+
+    media_url, _ = choose_media(info)
+    audio_url = choose_audio(info)
+
+    if (
+        not media_url
+        or not is_instagram_media_url(media_url)
+    ):
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_media_missing",
+        }), 422
+
+    if (
+        audio_url
+        and not is_instagram_media_url(audio_url)
+    ):
+        audio_url = None
+
+    temp_dir = tempfile.mkdtemp(
+        prefix="monceda-instagram-story-"
+    )
+
+    final_path = os.path.join(
+        temp_dir,
+        "instagram-story.mp4",
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-threads",
+        "2",
+        "-i",
+        media_url,
+    ]
+
+    if audio_url:
+        cmd += [
+            "-i",
+            audio_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+    else:
+        cmd += [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+        ]
+
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-threads",
+        "2",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ar",
+        "48000",
+        "-movflags",
+        "+faststart",
+        final_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_transcode_timeout",
+        }), 504
+
+    if (
+        result.returncode != 0
+        or not os.path.isfile(final_path)
+        or os.path.getsize(final_path) == 0
+    ):
+        detail = result.stderr[-1500:]
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_transcode_failed",
+            "detail": detail,
+        }), 422
+
+    response = send_file(
+        final_path,
+        mimetype="video/mp4",
+        as_attachment=True,
+        download_name="instagram-story.mp4",
+        conditional=False,
+    )
+
+    response.headers["Cache-Control"] = (
+        "private, no-store"
+    )
+    response.headers[
+        "X-Monceda-Instagram-Story"
+    ] = "h264-aac"
+
+    response.call_on_close(
+        lambda: shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+    )
+
+    return response
 
 
 @app.post("/instagram/normalize")
