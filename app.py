@@ -12,64 +12,12 @@ app = Flask(__name__)
 
 URL_RE = re.compile(r"^https?://", re.I)
 
-INSTAGRAM_COOKIE_SECRET_PATH = os.environ.get(
-    "INSTAGRAM_COOKIE_SECRET_PATH",
-    "/secrets/instagram/cookies.txt",
-)
-
-
-def is_instagram_story_url(value):
-    try:
-        parsed = urlparse(value)
-        host = re.sub(
-            r"^www\.",
-            "",
-            (parsed.hostname or "").lower(),
-        )
-
-        return (
-            host == "instagram.com"
-            and parsed.path.startswith("/stories/")
-        )
-    except Exception:
-        return False
-
-
-def copy_instagram_cookie_file(destination_dir=None):
-    """
-    Cloud Run Secret Manager mounts are read-only.
-
-    yt-dlp may update a Netscape cookie jar, so copy the
-    mounted Instagram-only secret into a writable temporary
-    file for each authenticated Story extraction.
-    """
-    source = INSTAGRAM_COOKIE_SECRET_PATH
-
-    if not os.path.isfile(source):
-        return None
-
-    fd, temp_path = tempfile.mkstemp(
-        prefix="monceda-instagram-cookies-",
-        suffix=".txt",
-        dir=destination_dir,
-    )
-
-    os.close(fd)
-
-    shutil.copyfile(source, temp_path)
-    os.chmod(temp_path, 0o600)
-
-    return temp_path
-
 
 def is_http_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
 def choose_media(info):
-    if not isinstance(info, dict):
-        return None, None
-
     # yt-dlp's selected media URL is normally here.
     if is_http_url(info.get("url")):
         return info.get("url"), info.get("ext") or "mp4"
@@ -104,9 +52,6 @@ def choose_media(info):
 
 
 def choose_audio(info):
-    if not isinstance(info, dict):
-        return None
-
     # First prefer an explicitly requested audio stream.
     requested = info.get("requested_formats") or []
 
@@ -224,7 +169,8 @@ def instagram_download():
                 "bestvideo[vcodec^=avc1]+"
                 "bestaudio[ext=m4a]/"
                 "best[ext=mp4][vcodec^=avc1]/"
-                "bestvideo+bestaudio/best"
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "best[ext=mp4]"
             ),
             "--merge-output-format",
             "mp4",
@@ -232,28 +178,6 @@ def instagram_download():
             output_template,
             url,
         ]
-
-        if is_instagram_story_url(url):
-            cookie_path = copy_instagram_cookie_file(
-                destination_dir=temp_dir
-            )
-
-            if not cookie_path:
-                shutil.rmtree(
-                    temp_dir,
-                    ignore_errors=True,
-                )
-
-                return jsonify({
-                    "status": "error",
-                    "error": "instagram_story_auth_unavailable",
-                }), 503
-
-            # Insert before the final URL argument.
-            cmd[-1:-1] = [
-                "--cookies",
-                cookie_path,
-            ]
 
         result = subprocess.run(
             cmd,
@@ -277,36 +201,16 @@ def instagram_download():
 
         candidates = []
 
-        temp_entries = []
         for name in os.listdir(temp_dir):
             path = os.path.join(temp_dir, name)
 
-            if os.path.isfile(path):
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    size = -1
-
-                temp_entries.append({
-                    "name": name,
-                    "size": size,
-                })
-
-                if name.lower().endswith(".mp4"):
-                    candidates.append(path)
+            if (
+                os.path.isfile(path)
+                and name.lower().endswith(".mp4")
+            ):
+                candidates.append(path)
 
         if not candidates:
-            print(
-                "INSTAGRAM DOWNLOAD DEBUG:",
-                {
-                    "returncode": result.returncode,
-                    "stdout": result.stdout[-3000:],
-                    "stderr": result.stderr[-3000:],
-                    "files": temp_entries,
-                },
-                flush=True,
-            )
-
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True,
@@ -315,88 +219,12 @@ def instagram_download():
             return jsonify({
                 "status": "error",
                 "error": "instagram_mp4_missing",
-                "debug": {
-                    "returncode": result.returncode,
-                    "stdout": result.stdout[-2000:],
-                    "stderr": result.stderr[-2000:],
-                    "files": temp_entries,
-                },
             }), 422
 
         final_path = max(
             candidates,
             key=os.path.getsize,
         )
-
-        # Instagram Stories must be normalized for Apple/QuickTime.
-        # A file being .mp4 is not enough: force H.264 + AAC,
-        # yuv420p and a standard non-fragmented MP4 layout.
-        if is_instagram_story_url(url):
-            compatible_path = os.path.join(
-                temp_dir,
-                "instagram-story-compatible.mp4",
-            )
-
-            transcode_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                final_path,
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
-                "-profile:v",
-                "high",
-                "-level",
-                "4.1",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ar",
-                "48000",
-                "-movflags",
-                "+faststart",
-                compatible_path,
-            ]
-
-            transcode_result = subprocess.run(
-                transcode_cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-
-            if (
-                transcode_result.returncode != 0
-                or not os.path.isfile(compatible_path)
-                or os.path.getsize(compatible_path) == 0
-            ):
-                shutil.rmtree(
-                    temp_dir,
-                    ignore_errors=True,
-                )
-
-                return jsonify({
-                    "status": "error",
-                    "error": "instagram_story_transcode_failed",
-                    "detail": transcode_result.stderr[-1200:],
-                }), 422
-
-            final_path = compatible_path
 
         response = send_file(
             final_path,
@@ -625,22 +453,6 @@ def extract():
         url,
     ]
 
-    cookie_path = None
-
-    if is_instagram_story_url(url):
-        cookie_path = copy_instagram_cookie_file()
-
-        if not cookie_path:
-            return jsonify({
-                "status": "error",
-                "error": "instagram_story_auth_unavailable",
-            }), 503
-
-        cmd[-1:-1] = [
-            "--cookies",
-            cookie_path,
-        ]
-
     try:
         result = subprocess.run(
             cmd,
@@ -654,12 +466,6 @@ def extract():
             "status": "error",
             "error": "extract_timeout",
         }), 504
-    finally:
-        if cookie_path:
-            try:
-                os.remove(cookie_path)
-            except OSError:
-                pass
 
     if result.returncode != 0:
         return jsonify({
