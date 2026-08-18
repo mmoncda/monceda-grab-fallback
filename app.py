@@ -114,7 +114,6 @@ def extract_instagram_story_info(url):
         "yt-dlp",
         "--cookies",
         cookie_path,
-        "--no-playlist",
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
