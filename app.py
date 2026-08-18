@@ -12,6 +12,55 @@ app = Flask(__name__)
 
 URL_RE = re.compile(r"^https?://", re.I)
 
+INSTAGRAM_COOKIE_SECRET_PATH = os.environ.get(
+    "INSTAGRAM_COOKIE_SECRET_PATH",
+    "/secrets/instagram/cookies.txt",
+)
+
+
+def is_instagram_story_url(value):
+    try:
+        parsed = urlparse(value)
+        host = re.sub(
+            r"^www\.",
+            "",
+            (parsed.hostname or "").lower(),
+        )
+
+        return (
+            host == "instagram.com"
+            and parsed.path.startswith("/stories/")
+        )
+    except Exception:
+        return False
+
+
+def copy_instagram_cookie_file(destination_dir=None):
+    """
+    Cloud Run Secret Manager mounts are read-only.
+
+    yt-dlp may update a Netscape cookie jar, so copy the
+    mounted Instagram-only secret into a writable temporary
+    file for each authenticated Story extraction.
+    """
+    source = INSTAGRAM_COOKIE_SECRET_PATH
+
+    if not os.path.isfile(source):
+        return None
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix="monceda-instagram-cookies-",
+        suffix=".txt",
+        dir=destination_dir,
+    )
+
+    os.close(fd)
+
+    shutil.copyfile(source, temp_path)
+    os.chmod(temp_path, 0o600)
+
+    return temp_path
+
 
 def is_http_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
@@ -168,7 +217,8 @@ def instagram_download():
                 "bestaudio[acodec^=mp4a]/"
                 "bestvideo[vcodec^=avc1]+"
                 "bestaudio[ext=m4a]/"
-                "best[ext=mp4][vcodec^=avc1]"
+                "best[ext=mp4][vcodec^=avc1]/"
+                "bestvideo+bestaudio/best"
             ),
             "--merge-output-format",
             "mp4",
@@ -176,6 +226,28 @@ def instagram_download():
             output_template,
             url,
         ]
+
+        if is_instagram_story_url(url):
+            cookie_path = copy_instagram_cookie_file(
+                destination_dir=temp_dir
+            )
+
+            if not cookie_path:
+                shutil.rmtree(
+                    temp_dir,
+                    ignore_errors=True,
+                )
+
+                return jsonify({
+                    "status": "error",
+                    "error": "instagram_story_auth_unavailable",
+                }), 503
+
+            # Insert before the final URL argument.
+            cmd[-1:-1] = [
+                "--cookies",
+                cookie_path,
+            ]
 
         result = subprocess.run(
             cmd,
@@ -451,6 +523,22 @@ def extract():
         url,
     ]
 
+    cookie_path = None
+
+    if is_instagram_story_url(url):
+        cookie_path = copy_instagram_cookie_file()
+
+        if not cookie_path:
+            return jsonify({
+                "status": "error",
+                "error": "instagram_story_auth_unavailable",
+            }), 503
+
+        cmd[-1:-1] = [
+            "--cookies",
+            cookie_path,
+        ]
+
     try:
         result = subprocess.run(
             cmd,
@@ -464,6 +552,12 @@ def extract():
             "status": "error",
             "error": "extract_timeout",
         }), 504
+    finally:
+        if cookie_path:
+            try:
+                os.remove(cookie_path)
+            except OSError:
+                pass
 
     if result.returncode != 0:
         return jsonify({
