@@ -288,6 +288,8 @@ def is_instagram_media_url(value):
             and (
                 host == "fbcdn.net"
                 or host.endswith(".fbcdn.net")
+                or host == "cdninstagram.com"
+                or host.endswith(".cdninstagram.com")
             )
         )
     except Exception:
