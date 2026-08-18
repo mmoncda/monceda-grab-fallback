@@ -460,6 +460,126 @@ def is_instagram_media_url(value):
 
 
 
+
+@app.post("/instagram/story/debug")
+def instagram_story_debug():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_instagram_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_instagram_story_url",
+        }), 400
+
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_auth_unavailable",
+        }), 503
+
+    cmd = [
+        "yt-dlp",
+        "--cookies",
+        cookie_path,
+        "--no-download",
+        "--no-warnings",
+        "--dump-single-json",
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        return jsonify({
+            "status": "error",
+            "error": "yt_dlp_failed",
+            "stderr": result.stderr[-1500:],
+        }), 422
+
+    try:
+        info = json.loads(result.stdout)
+    except Exception as error:
+        return jsonify({
+            "status": "error",
+            "error": "invalid_json",
+            "detail": str(error),
+        }), 502
+
+    def summarize(obj):
+        if not isinstance(obj, dict):
+            return {
+                "type": type(obj).__name__,
+            }
+
+        formats = obj.get("formats") or []
+
+        return {
+            "keys": sorted(obj.keys()),
+            "id": obj.get("id"),
+            "title": obj.get("title"),
+            "webpage_url": obj.get("webpage_url"),
+            "url_present": isinstance(obj.get("url"), str),
+            "url_host": (
+                urlparse(obj.get("url")).hostname
+                if isinstance(obj.get("url"), str)
+                else None
+            ),
+            "ext": obj.get("ext"),
+            "vcodec": obj.get("vcodec"),
+            "acodec": obj.get("acodec"),
+            "format_count": len(formats),
+            "formats": [
+                {
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "vcodec": f.get("vcodec"),
+                    "acodec": f.get("acodec"),
+                    "height": f.get("height"),
+                    "url_present": isinstance(f.get("url"), str),
+                    "url_host": (
+                        urlparse(f.get("url")).hostname
+                        if isinstance(f.get("url"), str)
+                        else None
+                    ),
+                }
+                for f in formats[:30]
+                if isinstance(f, dict)
+            ],
+        }
+
+    entries = info.get("entries")
+
+    return jsonify({
+        "status": "ok",
+        "root": summarize(info),
+        "entry_count": (
+            len(entries)
+            if isinstance(entries, list)
+            else None
+        ),
+        "entries": [
+            summarize(entry)
+            for entry in (entries or [])[:10]
+            if isinstance(entry, dict)
+        ],
+    })
+
+
 @app.post("/instagram/story/extract")
 def instagram_story_extract():
     data = request.get_json(silent=True) or {}
