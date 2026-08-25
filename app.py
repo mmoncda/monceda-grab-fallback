@@ -968,14 +968,28 @@ def extract():
             "error": "unsupported_host",
         }), 400
 
+    cookie_path = None
+
     cmd = [
         "yt-dlp",
+    ]
+
+    if host == "instagram.com":
+        cookie_path = copy_instagram_story_cookies()
+
+        if cookie_path:
+            cmd.extend([
+                "--cookies",
+                cookie_path,
+            ])
+
+    cmd.extend([
         "--no-playlist",
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
         url,
-    ]
+    ])
 
     try:
         result = subprocess.run(
@@ -990,6 +1004,12 @@ def extract():
             "status": "error",
             "error": "extract_timeout",
         }), 504
+    finally:
+        if cookie_path:
+            try:
+                os.remove(cookie_path)
+            except OSError:
+                pass
 
     if result.returncode != 0:
         return jsonify({
