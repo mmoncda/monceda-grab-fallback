@@ -1,3 +1,4 @@
 Flask>=3.1,<4
 gunicorn>=23,<24
 yt-dlp[default,curl-cffi]==2026.7.4
+requests

@@ -61,6 +61,36 @@ def copy_instagram_story_cookies(destination_dir=None):
     return temp_path
 
 
+INSTAGRAM_SHORTCODE_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789-_"
+)
+
+
+def instagram_media_id_to_shortcode(value):
+    text = str(value or "").strip()
+
+    if not text.isdigit():
+        return ""
+
+    number = int(text)
+
+    if number <= 0:
+        return ""
+
+    result = ""
+
+    while number:
+        number, remainder = divmod(number, 64)
+        result = (
+            INSTAGRAM_SHORTCODE_ALPHABET[remainder]
+            + result
+        )
+
+    return result
+
+
 def select_instagram_story_info(info, url):
     if not isinstance(info, dict):
         return None
@@ -85,10 +115,22 @@ def select_instagram_story_info(info, url):
         story_id = ""
 
     if story_id:
+        story_shortcode = (
+            instagram_media_id_to_shortcode(story_id)
+        )
+
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            entry_id = str(entry.get("id") or "")
+
             if (
-                isinstance(entry, dict)
-                and str(entry.get("id") or "") == story_id
+                entry_id == story_id
+                or (
+                    story_shortcode
+                    and entry_id == story_shortcode
+                )
             ):
                 return entry
 
@@ -114,6 +156,16 @@ def extract_instagram_story_info(url):
         "yt-dlp",
         "--cookies",
         cookie_path,
+        "-f",
+        (
+            "bestvideo[vcodec^=avc1]+"
+            "bestaudio[acodec^=mp4a]/"
+            "bestvideo[vcodec^=avc1]+"
+            "bestaudio[ext=m4a]/"
+            "best[ext=mp4][vcodec^=avc1]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]"
+        ),
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
@@ -159,10 +211,23 @@ def extract_instagram_story_info(url):
             502,
         )
 
+    root_entries = (
+        root_info.get("entries")
+        if isinstance(root_info, dict)
+        else None
+    )
+
     info = select_instagram_story_info(
         root_info,
         url,
     )
+
+    if isinstance(info, dict):
+        info["_monceda_root_entries"] = (
+            root_entries
+            if isinstance(root_entries, list)
+            else []
+        )
 
     if not isinstance(info, dict):
         return (
@@ -622,6 +687,58 @@ def instagram_story_extract():
 
     media_id = str(info.get("id") or "story")
 
+    story_items = []
+
+    root_entries = info.get("_monceda_root_entries")
+
+    if not isinstance(root_entries, list):
+        root_entries = []
+
+    for index, entry in enumerate(root_entries):
+        if not isinstance(entry, dict):
+            continue
+
+        item_media_url, item_ext = choose_media(entry)
+        item_audio_url = choose_audio(entry)
+
+        if (
+            not item_media_url
+            or not is_instagram_media_url(item_media_url)
+        ):
+            continue
+
+        if (
+            item_audio_url
+            and not is_instagram_media_url(item_audio_url)
+        ):
+            item_audio_url = None
+
+        item_id = str(
+            entry.get("id")
+            or f"story-{index + 1}"
+        )
+
+        item = {
+            "id": item_id,
+            "index": index + 1,
+            "url": item_media_url,
+            "ext": item_ext or "mp4",
+            "filename": (
+                f"instagram_story_{item_id}."
+                f"{item_ext or 'mp4'}"
+            ),
+            "title": str(
+                entry.get("title")
+                or f"Instagram Story {index + 1}"
+            ).strip(),
+            "duration": entry.get("duration"),
+        }
+
+        if item_audio_url:
+            item["audio_url"] = item_audio_url
+
+        story_items.append(item)
+
     response = {
         "status": "ok",
         "engine": "yt-dlp",
@@ -648,6 +765,10 @@ def instagram_story_extract():
 
     if audio_url:
         response["audio_url"] = audio_url
+
+    if story_items:
+        response["items"] = story_items
+        response["item_count"] = len(story_items)
 
     return jsonify(response)
 
@@ -823,6 +944,7 @@ def instagram_normalize():
     data = request.get_json(silent=True) or {}
     media_url = str(data.get("url", "")).strip()
     audio_url = str(data.get("audio_url", "")).strip()
+    fast_remux = data.get("fast_remux") is True
 
     if not is_instagram_media_url(media_url):
         return jsonify({
@@ -864,31 +986,56 @@ def instagram_normalize():
             "0:a:0?",
         ]
 
-    cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "superfast",
-        "-tune",
-        "zerolatency",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-threads",
-        "2",
+    if fast_remux:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.1",
+            "-threads",
+            "2",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+    else:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "superfast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            "2",
 
-        "-c:a",
-        "aac",
-        "-b:a",
-        "96k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
 
-        "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
-        "-f",
-        "mp4",
-        "pipe:1",
-    ]
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
 
     process = subprocess.Popen(
         cmd,
@@ -929,6 +1076,11 @@ def instagram_normalize():
     )
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["X-Monceda-Instagram"] = "h264-stream"
+
+    if fast_remux:
+        response.headers[
+            "X-Monceda-Instagram"
+        ] = "h264-aac-fast-compatible"
 
     return response
 
@@ -1064,6 +1216,459 @@ def extract():
         response["audio_url"] = audio_url
 
     return jsonify(response)
+
+
+
+
+FACEBOOK_COOKIE_SECRET_PATH = os.environ.get(
+    "FACEBOOK_COOKIE_SECRET_PATH",
+    "/secrets/facebook/cookies.txt",
+)
+
+
+def copy_facebook_story_cookies(destination_dir=None):
+    source = FACEBOOK_COOKIE_SECRET_PATH
+
+    if not os.path.isfile(source):
+        return None
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix="monceda-facebook-story-cookies-",
+        suffix=".txt",
+        dir=destination_dir,
+    )
+    os.close(fd)
+
+    shutil.copyfile(source, temp_path)
+    os.chmod(temp_path, 0o600)
+
+    return temp_path
+
+
+def facebook_story_browser_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def extract_facebook_story_photo_items(html):
+    if not isinstance(html, str) or len(html) < 10000:
+        return []
+
+    # Facebook's initial Story payload contains many fbcdn images,
+    # including avatars/thumbnails. Story photos use the post-image
+    # t39.30808-6 path, while profile pictures normally use
+    # t39.30808-1. Keep only the former.
+    pattern = re.compile(
+        r'https:\\?/\\?/scontent[^"\\]+?'
+        r'/v/t39\.30808-6/[^"\\]+?\.jpg[^"\\]*',
+        re.I,
+    )
+
+    candidates = []
+
+    for match in pattern.findall(html):
+        value = match
+
+        # Decode the common JSON/HTML escaping used by Facebook.
+        value = value.replace(r"\/", "/")
+        value = value.replace(r"\u0025", "%")
+        value = value.replace(r"\u0026", "&")
+        value = value.replace("&amp;", "&")
+
+        try:
+            value = bytes(
+                value,
+                "utf-8",
+            ).decode("unicode_escape")
+        except Exception:
+            pass
+
+        if not value.startswith("https://"):
+            continue
+
+        filename_match = re.search(
+            r"/([^/?]+\.jpg)",
+            value,
+            re.I,
+        )
+
+        if not filename_match:
+            continue
+
+        filename = filename_match.group(1)
+
+        # Strong signal from the authenticated Story payload:
+        # actual Story image filenames contain the owner's numeric
+        # post/story identifier and are not profile-picture URLs.
+        score = 0
+
+        if "/v/t39.30808-6/" in value:
+            score += 100
+
+        if "dst-jpg" in value:
+            score += 25
+
+        size_matches = re.findall(
+            r"(?:mx|s)(\d{3,4})x(\d{3,4})",
+            value,
+            re.I,
+        )
+
+        max_area = 0
+
+        for width, height in size_matches:
+            try:
+                area = int(width) * int(height)
+            except Exception:
+                continue
+
+            max_area = max(max_area, area)
+
+        if max_area >= 1000000:
+            score += 60
+        elif max_area >= 500000:
+            score += 40
+
+        candidates.append({
+            "url": value,
+            "filename": filename,
+            "score": score,
+            "area": max_area,
+        })
+
+    # Deduplicate by the stable Facebook image filename.
+    best_by_filename = {}
+
+    for item in candidates:
+        key = item["filename"]
+
+        previous = best_by_filename.get(key)
+
+        if previous is None or (
+            item["score"],
+            item["area"],
+            len(item["url"]),
+        ) > (
+            previous["score"],
+            previous["area"],
+            len(previous["url"]),
+        ):
+            best_by_filename[key] = item
+
+    ranked = sorted(
+        best_by_filename.values(),
+        key=lambda item: (
+            item["score"],
+            item["area"],
+        ),
+        reverse=True,
+    )
+
+    # Do not expose weak avatar/UI candidates.
+    ranked = [
+        item
+        for item in ranked
+        if item["score"] >= 125
+    ]
+
+    result = []
+
+    for index, item in enumerate(ranked, 1):
+        result.append({
+            "index": index,
+            "id": item["filename"].rsplit(".", 1)[0],
+            "type": "image",
+            "ext": "jpg",
+            "filename": item["filename"],
+            "url": item["url"],
+            "thumbnail": item["url"],
+        })
+
+    return result
+
+
+def fetch_facebook_story_html(url):
+    cookie_path = copy_facebook_story_cookies()
+
+    if not cookie_path:
+        return (
+            None,
+            "facebook_story_auth_unavailable",
+            "",
+            503,
+        )
+
+    try:
+        import requests
+    except Exception as exc:
+        try:
+            os.unlink(cookie_path)
+        except OSError:
+            pass
+
+        return (
+            None,
+            "facebook_story_requests_unavailable",
+            str(exc),
+            500,
+        )
+
+    session = requests.Session()
+    session.headers.update(
+        facebook_story_browser_headers()
+    )
+
+    try:
+        # requests does not directly consume Netscape cookie files.
+        # Parse only valid cookie records from the mounted secret.
+        with open(
+            cookie_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+        ) as handle:
+            for line in handle:
+                line = line.rstrip("\n")
+
+                if (
+                    not line
+                    or line.startswith("#")
+                    or "\t" not in line
+                ):
+                    continue
+
+                parts = line.split("\t")
+
+                if len(parts) != 7:
+                    continue
+
+                domain, _, cookie_path_value, secure, _, name, value = parts
+
+                session.cookies.set(
+                    name,
+                    value,
+                    domain=domain.lstrip("."),
+                    path=cookie_path_value or "/",
+                    secure=(secure.upper() == "TRUE"),
+                )
+
+        response = session.get(
+            url,
+            timeout=45,
+            allow_redirects=True,
+        )
+
+        html = response.text or ""
+
+        if response.status_code != 200:
+            return (
+                None,
+                "facebook_story_http_error",
+                f"HTTP {response.status_code}",
+                502,
+            )
+
+        if len(html) < 10000:
+            return (
+                None,
+                "facebook_story_payload_too_small",
+                f"payload_bytes={len(html)}",
+                502,
+            )
+
+        return html, None, "", 200
+
+    except requests.RequestException as exc:
+        return (
+            None,
+            "facebook_story_fetch_failed",
+            str(exc),
+            502,
+        )
+
+    finally:
+        try:
+            os.unlink(cookie_path)
+        except OSError:
+            pass
+
+
+def is_facebook_story_url(value):
+    try:
+        parsed = urlparse(value)
+
+        host = re.sub(
+            r"^www\.",
+            "",
+            (parsed.hostname or "").lower(),
+        )
+
+        return (
+            parsed.scheme == "https"
+            and host in {
+                "facebook.com",
+                "m.facebook.com",
+            }
+            and parsed.path.startswith("/stories/")
+        )
+    except Exception:
+        return False
+
+
+@app.post("/facebook/story/extract")
+def facebook_story_extract():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_facebook_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_facebook_story_url",
+        }), 400
+
+    html, error, detail, status_code = (
+        fetch_facebook_story_html(url)
+    )
+
+    if error:
+        return jsonify({
+            "status": "error",
+            "error": error,
+            "detail": detail,
+        }), status_code
+
+    items = extract_facebook_story_photo_items(html)
+
+    if not items:
+        return jsonify({
+            "status": "error",
+            "error": "facebook_story_media_not_found",
+        }), 422
+
+    return jsonify({
+        "status": "ok",
+        "engine": "facebook-story-html",
+        "item_count": len(items),
+        "items": items,
+    })
+
+
+@app.post("/facebook/story/debug")
+def facebook_story_debug():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_facebook_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_facebook_story_url",
+        }), 400
+
+    cmd = [
+        "yt-dlp",
+        "--no-download",
+        "--no-warnings",
+        "--dump-single-json",
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "status": "error",
+            "error": "facebook_story_extract_timeout",
+        }), 504
+
+    if result.returncode != 0:
+        return jsonify({
+            "status": "error",
+            "error": "facebook_story_extract_failed",
+            "detail": result.stderr[-2000:],
+        }), 422
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return jsonify({
+            "status": "error",
+            "error": "facebook_story_invalid_response",
+        }), 502
+
+    entries = (
+        info.get("entries")
+        if isinstance(info, dict)
+        else None
+    )
+
+    if not isinstance(entries, list):
+        entries = []
+
+    def summarize(item, index):
+        if not isinstance(item, dict):
+            return None
+
+        media_url, ext = choose_media(item)
+
+        return {
+            "index": index,
+            "id": str(item.get("id") or ""),
+            "title": str(item.get("title") or "")[:120],
+            "ext": ext,
+            "has_media_url": bool(media_url),
+            "webpage_url": str(
+                item.get("webpage_url") or ""
+            )[:300],
+        }
+
+    summarized = []
+
+    for index, entry in enumerate(entries, 1):
+        item = summarize(entry, index)
+
+        if item:
+            summarized.append(item)
+
+    root_media_url, root_ext = choose_media(info)
+
+    return jsonify({
+        "status": "ok",
+        "extractor": str(
+            info.get("extractor") or ""
+        ),
+        "extractor_key": str(
+            info.get("extractor_key") or ""
+        ),
+        "root_id": str(info.get("id") or ""),
+        "root_ext": root_ext,
+        "root_has_media_url": bool(root_media_url),
+        "entry_count": len(entries),
+        "entries": summarized,
+    })
+
 
 
 if __name__ == "__main__":
