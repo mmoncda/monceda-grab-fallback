@@ -737,6 +737,14 @@ def instagram_story_extract():
         if item_audio_url:
             item["audio_url"] = item_audio_url
 
+        item_thumbnail = entry.get("thumbnail")
+
+        if (
+            isinstance(item_thumbnail, str)
+            and item_thumbnail.startswith("https://")
+        ):
+            item["thumbnail"] = item_thumbnail
+
         story_items.append(item)
 
     response = {
