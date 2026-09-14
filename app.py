@@ -13,11 +13,6 @@ app = Flask(__name__)
 
 URL_RE = re.compile(r"^https?://", re.I)
 
-INSTAGRAM_COOKIE_SECRET_PATH = os.environ.get(
-    "INSTAGRAM_COOKIE_SECRET_PATH",
-    "/secrets/instagram/cookies.txt",
-)
-
 
 def is_instagram_story_url(value):
     try:
@@ -40,25 +35,6 @@ def is_instagram_story_url(value):
         )
     except Exception:
         return False
-
-
-def copy_instagram_story_cookies(destination_dir=None):
-    source = INSTAGRAM_COOKIE_SECRET_PATH
-
-    if not os.path.isfile(source):
-        return None
-
-    fd, temp_path = tempfile.mkstemp(
-        prefix="monceda-instagram-story-cookies-",
-        suffix=".txt",
-        dir=destination_dir,
-    )
-    os.close(fd)
-
-    shutil.copyfile(source, temp_path)
-    os.chmod(temp_path, 0o600)
-
-    return temp_path
 
 
 INSTAGRAM_SHORTCODE_ALPHABET = (
@@ -142,20 +118,15 @@ def select_instagram_story_info(info, url):
 
 
 def extract_instagram_story_info(url):
-    cookie_path = copy_instagram_story_cookies()
+    """
+    Extract only Stories that Instagram exposes without using
+    Monceda Grab's authenticated account session.
 
-    if not cookie_path:
-        return (
-            None,
-            "instagram_story_auth_unavailable",
-            "",
-            503,
-        )
-
+    If Instagram requires authentication, fail closed instead
+    of expanding the caller's access through server credentials.
+    """
     cmd = [
         "yt-dlp",
-        "--cookies",
-        cookie_path,
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
@@ -177,17 +148,12 @@ def extract_instagram_story_info(url):
             "",
             504,
         )
-    finally:
-        try:
-            os.remove(cookie_path)
-        except OSError:
-            pass
 
     if result.returncode != 0:
         return (
             None,
-            "instagram_story_extract_failed",
-            result.stderr[-1500:],
+            "instagram_story_public_unavailable",
+            "",
             422,
         )
 
@@ -222,13 +188,12 @@ def extract_instagram_story_info(url):
     if not isinstance(info, dict):
         return (
             None,
-            "instagram_story_media_missing",
+            "instagram_story_public_unavailable",
             "",
             422,
         )
 
     return info, None, "", 200
-
 
 
 INSTAGRAM_ID_CHARS = (
@@ -257,7 +222,6 @@ def instagram_pk_to_id(media_id):
         encoded.append(INSTAGRAM_ID_CHARS[remainder])
 
     return "".join(reversed(encoded))
-
 
 
 def is_http_url(value):
@@ -596,180 +560,16 @@ def is_instagram_media_url(value):
         return False
 
 
-
-
 def fetch_instagram_raw_story_items(url):
     """
-    Return Instagram's raw Story items.
+    Authenticated Instagram Story API enrichment is intentionally
+    disabled for the public Monceda Grab service.
 
-    This supplements yt-dlp because Instagram photo Stories may
-    be omitted from yt-dlp's final playlist when they contain no
-    video formats.
+    Anonymous yt-dlp output remains the only Story source. This
+    means some photo Stories may be unavailable rather than using
+    Monceda Grab's account session to expand access.
     """
-    cookie_path = copy_instagram_story_cookies()
-
-    if not cookie_path:
-        return []
-
-    try:
-        import requests
-        from http.cookiejar import MozillaCookieJar
-
-        jar = MozillaCookieJar(cookie_path)
-        jar.load(
-            ignore_discard=True,
-            ignore_expires=True,
-        )
-
-        session = requests.Session()
-
-        for cookie in jar:
-            session.cookies.set(
-                cookie.name,
-                cookie.value,
-                domain=cookie.domain,
-                path=cookie.path,
-            )
-
-        browser_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
-        resolve_cmd = [
-            "yt-dlp",
-            "--cookies",
-            cookie_path,
-            "--no-download",
-            "--no-warnings",
-            "--dump-single-json",
-            url,
-        ]
-
-        resolve_result = subprocess.run(
-            resolve_cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-
-        if resolve_result.returncode != 0:
-            return []
-
-        try:
-            resolved = json.loads(resolve_result.stdout)
-        except Exception:
-            return []
-
-        entries = (
-            resolved.get("entries")
-            if isinstance(resolved, dict)
-            else None
-        )
-
-        candidates = (
-            entries
-            if isinstance(entries, list)
-            else [resolved]
-        )
-
-        user_id = None
-
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-
-            value = (
-                candidate.get("uploader_id")
-                or candidate.get("channel_id")
-                or candidate.get("playlist_uploader_id")
-            )
-
-            if value:
-                user_id = str(value)
-                break
-
-        if (
-            not user_id
-            and isinstance(resolved, dict)
-        ):
-            value = (
-                resolved.get("uploader_id")
-                or resolved.get("channel_id")
-                or resolved.get("playlist_uploader_id")
-            )
-
-            if value:
-                user_id = str(value)
-
-        if not user_id:
-            return []
-
-        api_headers = {
-            **browser_headers,
-            "Accept": "*/*",
-            "Referer": "https://www.instagram.com/",
-            "X-IG-App-ID": "936619743392459",
-            "X-ASBD-ID": "359341",
-            "X-IG-WWW-Claim": "0",
-            "Origin": "https://www.instagram.com",
-        }
-
-        api_response = session.get(
-            (
-                "https://www.instagram.com/api/v1/"
-                "feed/reels_media/"
-            ),
-            params={
-                "reel_ids": user_id,
-            },
-            headers=api_headers,
-            timeout=30,
-        )
-
-        if api_response.status_code != 200:
-            return []
-
-        try:
-            payload = api_response.json()
-        except Exception:
-            return []
-
-        reels = payload.get("reels") or {}
-
-        reel = (
-            reels.get(str(user_id))
-            if isinstance(reels, dict)
-            else None
-        )
-
-        items = (
-            reel.get("items") or []
-            if isinstance(reel, dict)
-            else []
-        )
-
-        return [
-            item
-            for item in items
-            if isinstance(item, dict)
-        ]
-
-    except Exception:
-        # Raw enrichment is deliberately non-fatal.
-        # Existing yt-dlp Story extraction remains the fallback.
-        return []
-
-    finally:
-        try:
-            os.remove(cookie_path)
-        except OSError:
-            pass
+    return []
 
 
 def choose_instagram_story_photo(raw_item):
@@ -837,582 +637,46 @@ def choose_instagram_story_photo(raw_item):
     return image_url, image_ext
 
 
-
 @app.post("/instagram/story/debug")
+
 def instagram_story_debug():
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-
-    if not is_instagram_story_url(url):
-        return jsonify({
-            "status": "error",
-            "error": "invalid_instagram_story_url",
-        }), 400
-
-    cookie_path = copy_instagram_story_cookies()
-
-    if not cookie_path:
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_auth_unavailable",
-        }), 503
-
-    cmd = [
-        "yt-dlp",
-        "--cookies",
-        cookie_path,
-        "--no-download",
-        "--no-warnings",
-        "--dump-single-json",
-        url,
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    finally:
-        try:
-            os.remove(cookie_path)
-        except OSError:
-            pass
-
-    if result.returncode != 0:
-        return jsonify({
-            "status": "error",
-            "error": "yt_dlp_failed",
-            "stderr": result.stderr[-1500:],
-        }), 422
-
-    try:
-        info = json.loads(result.stdout)
-    except Exception as error:
-        return jsonify({
-            "status": "error",
-            "error": "invalid_json",
-            "detail": str(error),
-        }), 502
-
-    def summarize(obj):
-        if not isinstance(obj, dict):
-            return {
-                "type": type(obj).__name__,
-            }
-
-        formats = obj.get("formats") or []
-
-        return {
-            "keys": sorted(obj.keys()),
-            "id": obj.get("id"),
-            "title": obj.get("title"),
-            "webpage_url": obj.get("webpage_url"),
-            "url_present": isinstance(obj.get("url"), str),
-            "url_host": (
-                urlparse(obj.get("url")).hostname
-                if isinstance(obj.get("url"), str)
-                else None
-            ),
-            "ext": obj.get("ext"),
-            "vcodec": obj.get("vcodec"),
-            "acodec": obj.get("acodec"),
-            "width": obj.get("width"),
-            "height": obj.get("height"),
-            "duration": obj.get("duration"),
-            "format_id": obj.get("format_id"),
-            "format_note": obj.get("format_note"),
-            "protocol": obj.get("protocol"),
-            "thumbnail_present": isinstance(
-                obj.get("thumbnail"),
-                str,
-            ),
-            "thumbnail_host": (
-                urlparse(obj.get("thumbnail")).hostname
-                if isinstance(obj.get("thumbnail"), str)
-                else None
-            ),
-            "thumbnail_count": len(
-                obj.get("thumbnails") or []
-            ),
-            "thumbnails": [
-                {
-                    "id": item.get("id"),
-                    "ext": item.get("ext"),
-                    "width": item.get("width"),
-                    "height": item.get("height"),
-                    "preference": item.get("preference"),
-                    "url_present": isinstance(
-                        item.get("url"),
-                        str,
-                    ),
-                    "url_host": (
-                        urlparse(item.get("url")).hostname
-                        if isinstance(item.get("url"), str)
-                        else None
-                    ),
-                }
-                for item in (obj.get("thumbnails") or [])[:30]
-                if isinstance(item, dict)
-            ],
-            "requested_format_count": len(
-                obj.get("requested_formats") or []
-            ),
-            "format_count": len(formats),
-            "formats": [
-                {
-                    "format_id": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "vcodec": f.get("vcodec"),
-                    "acodec": f.get("acodec"),
-                    "height": f.get("height"),
-                    "url_present": isinstance(f.get("url"), str),
-                    "url_host": (
-                        urlparse(f.get("url")).hostname
-                        if isinstance(f.get("url"), str)
-                        else None
-                    ),
-                }
-                for f in formats[:30]
-                if isinstance(f, dict)
-            ],
-        }
-
-    entries = info.get("entries")
-
+    """
+    Disabled in the public service because the previous diagnostic
+    implementation used Monceda Grab's authenticated Instagram
+    session.
+    """
     return jsonify({
-        "status": "ok",
-        "root": summarize(info),
-        "entry_count": (
-            len(entries)
-            if isinstance(entries, list)
-            else None
-        ),
-        "entries": [
-            summarize(entry)
-            for entry in (entries or [])[:10]
-            if isinstance(entry, dict)
-        ],
-    })
-
+        "status": "error",
+        "error": "not_found",
+    }), 404
 
 
 @app.post("/instagram/story/raw-debug")
+
 def instagram_story_raw_debug():
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-
-    if not is_instagram_story_url(url):
-        return jsonify({
-            "status": "error",
-            "error": "invalid_instagram_story_url",
-        }), 400
-
-    match = re.search(
-        r"/stories/([^/?#]+)",
-        url,
-        re.I,
-    )
-
-    username = (
-        match.group(1)
-        if match
-        else ""
-    )
-
-    if not username or username.lower() == "highlights":
-        return jsonify({
-            "status": "error",
-            "error": "unsupported_story_debug_url",
-        }), 400
-
-    cookie_path = copy_instagram_story_cookies()
-
-    if not cookie_path:
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_auth_unavailable",
-        }), 503
-
-    try:
-        import requests
-        from http.cookiejar import MozillaCookieJar
-
-        jar = MozillaCookieJar(cookie_path)
-        jar.load(
-            ignore_discard=True,
-            ignore_expires=True,
-        )
-
-        session = requests.Session()
-
-        for cookie in jar:
-            session.cookies.set(
-                cookie.name,
-                cookie.value,
-                domain=cookie.domain,
-                path=cookie.path,
-            )
-
-        browser_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
-        page_response = session.get(
-            url,
-            headers=browser_headers,
-            timeout=30,
-            allow_redirects=True,
-        )
-
-        page_html = page_response.text or ""
-
-        #
-        # Resolve the Story owner ID using yt-dlp itself.
-        # This avoids fragile HTML regex parsing and mirrors
-        # the extractor already proven to understand the page.
-        #
-        resolve_cmd = [
-            "yt-dlp",
-            "--cookies",
-            cookie_path,
-            "--no-download",
-            "--no-warnings",
-            "--dump-single-json",
-            url,
-        ]
-
-        resolve_result = subprocess.run(
-            resolve_cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-
-        user_id = None
-
-        if resolve_result.returncode == 0:
-            try:
-                resolved = json.loads(
-                    resolve_result.stdout
-                )
-
-                entries = (
-                    resolved.get("entries")
-                    if isinstance(resolved, dict)
-                    else None
-                )
-
-                candidates = (
-                    entries
-                    if isinstance(entries, list)
-                    else [resolved]
-                )
-
-                for candidate in candidates:
-                    if not isinstance(candidate, dict):
-                        continue
-
-                    value = (
-                        candidate.get("uploader_id")
-                        or candidate.get("channel_id")
-                        or candidate.get("playlist_uploader_id")
-                    )
-
-                    if value:
-                        user_id = str(value)
-                        break
-
-                if (
-                    not user_id
-                    and isinstance(resolved, dict)
-                ):
-                    value = (
-                        resolved.get("uploader_id")
-                        or resolved.get("channel_id")
-                        or resolved.get("playlist_uploader_id")
-                    )
-
-                    if value:
-                        user_id = str(value)
-
-            except Exception:
-                user_id = None
-
-        if not user_id:
-            return jsonify({
-                "status": "error",
-                "error": "instagram_story_user_id_missing",
-                "page_status": page_response.status_code,
-            }), 422
-
-        api_headers = {
-            **browser_headers,
-            "Accept": "*/*",
-            "Referer": "https://www.instagram.com/",
-            "X-IG-App-ID": "936619743392459",
-            "X-ASBD-ID": "359341",
-            "X-IG-WWW-Claim": "0",
-            "Origin": "https://www.instagram.com",
-        }
-
-        api_response = session.get(
-            (
-                "https://www.instagram.com/api/v1/"
-                "feed/reels_media/"
-            ),
-            params={
-                "reel_ids": user_id,
-            },
-            headers=api_headers,
-            timeout=30,
-        )
-
-        try:
-            payload = api_response.json()
-        except Exception:
-            return jsonify({
-                "status": "error",
-                "error": "instagram_story_api_invalid_json",
-                "api_status": api_response.status_code,
-            }), 502
-
-        reels = payload.get("reels") or {}
-
-        reel = (
-            reels.get(str(user_id))
-            if isinstance(reels, dict)
-            else None
-        )
-
-        items = (
-            reel.get("items") or []
-            if isinstance(reel, dict)
-            else []
-        )
-
-        safe_items = []
-
-        for index, item in enumerate(items, 1):
-            if not isinstance(item, dict):
-                continue
-
-            image_candidates = (
-                (
-                    item.get("image_versions2")
-                    or {}
-                ).get("candidates")
-                or []
-            )
-
-            safe_images = []
-
-            for candidate in image_candidates:
-                if not isinstance(candidate, dict):
-                    continue
-
-                image_url = candidate.get("url")
-
-                safe_images.append({
-                    "width": candidate.get("width"),
-                    "height": candidate.get("height"),
-                    "url_present": isinstance(
-                        image_url,
-                        str,
-                    ),
-                    "url_host": (
-                        urlparse(image_url).hostname
-                        if isinstance(image_url, str)
-                        else None
-                    ),
-                })
-
-            safe_items.append({
-                "index": index,
-                "pk": str(item.get("pk") or ""),
-                "media_type": item.get("media_type"),
-                "product_type": item.get("product_type"),
-                "video_duration": item.get("video_duration"),
-                "has_audio": item.get("has_audio"),
-                "video_version_count": len(
-                    item.get("video_versions") or []
-                ),
-                "image_candidate_count": len(
-                    image_candidates
-                ),
-                "images": safe_images[:30],
-            })
-
-        return jsonify({
-            "status": "ok",
-            "page_status": page_response.status_code,
-            "api_status": api_response.status_code,
-            "user_id_present": bool(user_id),
-            "item_count": len(safe_items),
-            "items": safe_items,
-        })
-
-    except Exception as error:
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_raw_debug_failed",
-            "detail": str(error),
-        }), 500
-
-    finally:
-        try:
-            os.remove(cookie_path)
-        except OSError:
-            pass
+    """
+    Disabled in the public service because the previous diagnostic
+    implementation used Monceda Grab's authenticated Instagram
+    session.
+    """
+    return jsonify({
+        "status": "error",
+        "error": "not_found",
+    }), 404
 
 
 @app.post("/instagram/story/web-debug")
+
 def instagram_story_web_debug():
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-
-    if not is_instagram_story_url(url):
-        return jsonify({
-            "status": "error",
-            "error": "invalid_instagram_story_url",
-        }), 400
-
-    cookie_path = copy_instagram_story_cookies()
-
-    if not cookie_path:
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_auth_unavailable",
-        }), 503
-
-    try:
-        import requests
-        from http.cookiejar import MozillaCookieJar
-
-        jar = MozillaCookieJar(cookie_path)
-        jar.load(ignore_discard=True, ignore_expires=True)
-
-        session = requests.Session()
-
-        for cookie in jar:
-            session.cookies.set(
-                cookie.name,
-                cookie.value,
-                domain=cookie.domain,
-                path=cookie.path,
-            )
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,"
-                "application/xml;q=0.9,image/avif,"
-                "image/webp,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=30,
-            allow_redirects=True,
-        )
-
-        html = response.text or ""
-
-        signals = {
-            "reels_media": html.count("reels_media"),
-            "video_versions": html.count("video_versions"),
-            "image_versions2": html.count("image_versions2"),
-            "image_versions": html.count("image_versions"),
-            "story": html.lower().count("story"),
-            "media_type": html.count("media_type"),
-            "pk": html.count('"pk"'),
-            "playable_url": html.count("playable_url"),
-            "display_url": html.count("display_url"),
-            "candidate": html.count("candidates"),
-        }
-
-        safe_hosts = []
-
-        import re
-        from urllib.parse import urlparse
-
-        found_urls = re.findall(
-            r'https?[^"\'\\\s<>]+',
-            html,
-            re.I,
-        )
-
-        for candidate in found_urls:
-            candidate = (
-                candidate
-                .replace("\\u0026", "&")
-                .replace("\\/", "/")
-            )
-
-            try:
-                host = (
-                    urlparse(candidate).hostname
-                    or ""
-                ).lower()
-            except Exception:
-                continue
-
-            if (
-                host
-                and (
-                    "cdninstagram.com" in host
-                    or "fbcdn.net" in host
-                )
-                and host not in safe_hosts
-            ):
-                safe_hosts.append(host)
-
-            if len(safe_hosts) >= 20:
-                break
-
-        return jsonify({
-            "status": "ok",
-            "http_status": response.status_code,
-            "final_host": (
-                urlparse(response.url).hostname or ""
-            ),
-            "html_length": len(html),
-            "signals": signals,
-            "media_hosts": safe_hosts,
-            "media_host_count": len(safe_hosts),
-            "authenticated_cookie_count": len(
-                list(session.cookies)
-            ),
-        })
-
-    except Exception as error:
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_web_debug_failed",
-            "detail": str(error)[:500],
-        }), 502
-
-    finally:
-        try:
-            os.remove(cookie_path)
-        except OSError:
-            pass
-
+    """
+    Disabled in the public service because the previous diagnostic
+    implementation used Monceda Grab's authenticated Instagram
+    session.
+    """
+    return jsonify({
+        "status": "error",
+        "error": "not_found",
+    }), 404
 
 
 @app.post("/instagram/story/extract")
@@ -2254,33 +1518,6 @@ def extract():
     return jsonify(response)
 
 
-
-
-FACEBOOK_COOKIE_SECRET_PATH = os.environ.get(
-    "FACEBOOK_COOKIE_SECRET_PATH",
-    "/secrets/facebook/cookies.txt",
-)
-
-
-def copy_facebook_story_cookies(destination_dir=None):
-    source = FACEBOOK_COOKIE_SECRET_PATH
-
-    if not os.path.isfile(source):
-        return None
-
-    fd, temp_path = tempfile.mkstemp(
-        prefix="monceda-facebook-story-cookies-",
-        suffix=".txt",
-        dir=destination_dir,
-    )
-    os.close(fd)
-
-    shutil.copyfile(source, temp_path)
-    os.chmod(temp_path, 0o600)
-
-    return temp_path
-
-
 def facebook_story_browser_headers():
     return {
         "User-Agent": (
@@ -2441,28 +1678,20 @@ def extract_facebook_story_photo_items(html):
 
 
 def fetch_facebook_story_html(url):
-    cookie_path = copy_facebook_story_cookies()
+    """
+    Fetch only Facebook Story pages available without Monceda Grab's
+    authenticated Facebook session.
 
-    if not cookie_path:
-        return (
-            None,
-            "facebook_story_auth_unavailable",
-            "",
-            503,
-        )
-
+    Authentication redirects, inaccessible pages, and non-Facebook
+    redirect targets fail closed.
+    """
     try:
         import requests
-    except Exception as exc:
-        try:
-            os.unlink(cookie_path)
-        except OSError:
-            pass
-
+    except Exception:
         return (
             None,
-            "facebook_story_requests_unavailable",
-            str(exc),
+            "facebook_story_processor_unavailable",
+            "",
             500,
         )
 
@@ -2472,78 +1701,68 @@ def fetch_facebook_story_html(url):
     )
 
     try:
-        # requests does not directly consume Netscape cookie files.
-        # Parse only valid cookie records from the mounted secret.
-        with open(
-            cookie_path,
-            "r",
-            encoding="utf-8",
-            errors="ignore",
-        ) as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-
-                if (
-                    not line
-                    or line.startswith("#")
-                    or "\t" not in line
-                ):
-                    continue
-
-                parts = line.split("\t")
-
-                if len(parts) != 7:
-                    continue
-
-                domain, _, cookie_path_value, secure, _, name, value = parts
-
-                session.cookies.set(
-                    name,
-                    value,
-                    domain=domain.lstrip("."),
-                    path=cookie_path_value or "/",
-                    secure=(secure.upper() == "TRUE"),
-                )
-
         response = session.get(
             url,
             timeout=45,
             allow_redirects=True,
         )
 
-        html = response.text or ""
+        try:
+            final_url = urlparse(response.url)
+            final_host = re.sub(
+                r"^www\.",
+                "",
+                (final_url.hostname or "").lower(),
+            )
+        except Exception:
+            return (
+                None,
+                "facebook_story_public_unavailable",
+                "",
+                422,
+            )
+
+        if (
+            final_url.scheme != "https"
+            or final_host not in {
+                "facebook.com",
+                "m.facebook.com",
+            }
+        ):
+            return (
+                None,
+                "facebook_story_public_unavailable",
+                "",
+                422,
+            )
 
         if response.status_code != 200:
             return (
                 None,
-                "facebook_story_http_error",
-                f"HTTP {response.status_code}",
-                502,
+                "facebook_story_public_unavailable",
+                "",
+                422,
             )
+
+        html = response.text or ""
 
         if len(html) < 10000:
             return (
                 None,
-                "facebook_story_payload_too_small",
-                f"payload_bytes={len(html)}",
-                502,
+                "facebook_story_public_unavailable",
+                "",
+                422,
             )
 
         return html, None, "", 200
 
-    except requests.RequestException as exc:
+    except requests.RequestException:
         return (
             None,
-            "facebook_story_fetch_failed",
-            str(exc),
-            502,
+            "facebook_story_public_unavailable",
+            "",
+            422,
         )
-
-    finally:
-        try:
-            os.unlink(cookie_path)
-        except OSError:
-            pass
 
 
 def is_facebook_story_url(value):
@@ -2704,7 +1923,6 @@ def facebook_story_debug():
         "entry_count": len(entries),
         "entries": summarized,
     })
-
 
 
 if __name__ == "__main__":
