@@ -1,0 +1,38 @@
+steps:
+  - id: test
+    name: python:3.13-slim
+    entrypoint: /bin/sh
+    args:
+      - -ceu
+      - |
+        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
+        MONCEDA_PROCESSOR_TOKEN=monceda-ci-test-token \
+          python -m unittest -v test_processor_contract.py
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --no-cache
+      - -t
+      - ${_IMAGE}:$COMMIT_SHA
+      - -f
+      - Dockerfile
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_IMAGE}:$COMMIT_SHA
+
+images:
+  - ${_IMAGE}:$COMMIT_SHA
+
+substitutions:
+  _IMAGE: asia-southeast1-docker.pkg.dev/monceda-grab/cloud-run-source-deploy/monceda-grab-fallback
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s
