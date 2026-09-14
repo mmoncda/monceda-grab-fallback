@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import re
@@ -9,6 +10,67 @@ from urllib.parse import urlparse
 from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
+
+PROCESSOR_TOKEN_ENV = "MONCEDA_PROCESSOR_TOKEN"
+PROCESSOR_TOKEN_HEADER = "X-Monceda-Processor-Token"
+
+PROTECTED_PROCESSOR_ENDPOINTS = frozenset({
+    "instagram_download",
+    "instagram_story_extract",
+    "instagram_story_download",
+    "instagram_normalize",
+    "extract",
+    "facebook_story_extract",
+})
+
+
+@app.before_request
+def enforce_processor_auth():
+    """
+    Restrict productive processor routes to trusted server-side callers.
+
+    Health remains public. Production-disabled debug routes remain 404
+    and are intentionally excluded from this authentication boundary.
+    """
+    endpoint = request.endpoint or ""
+
+    if endpoint not in PROTECTED_PROCESSOR_ENDPOINTS:
+        return None
+
+    expected_token = os.environ.get(
+        PROCESSOR_TOKEN_ENV,
+        "",
+    ).strip()
+
+    if not expected_token:
+        app.logger.error(
+            "Processor authentication token is not configured"
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "service_unavailable",
+        }), 503
+
+    provided_token = request.headers.get(
+        PROCESSOR_TOKEN_HEADER,
+        "",
+    )
+
+    if (
+        not provided_token
+        or not hmac.compare_digest(
+            provided_token.encode("utf-8"),
+            expected_token.encode("utf-8"),
+        )
+    ):
+        return jsonify({
+            "status": "error",
+            "error": "unauthorized",
+        }), 401
+
+    return None
+
 
 
 URL_RE = re.compile(r"^https?://", re.I)
