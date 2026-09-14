@@ -362,21 +362,15 @@ def health():
 
 
 @app.get("/debug/impersonation")
-def debug_impersonation():
-    result = subprocess.run(
-        ["yt-dlp", "--list-impersonate-targets"],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
 
+def debug_impersonation():
+    """
+    Production diagnostic endpoint intentionally disabled.
+    """
     return jsonify({
-        "status": "ok" if result.returncode == 0 else "error",
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    })
+        "status": "error",
+        "error": "not_found",
+    }), 404
 
 
 @app.post("/instagram/download")
@@ -460,7 +454,6 @@ def instagram_download():
             return jsonify({
                 "status": "error",
                 "error": "instagram_download_failed",
-                "detail": result.stderr[-1200:],
             }), 422
 
         candidates = []
@@ -538,7 +531,6 @@ def instagram_download():
         return jsonify({
             "status": "error",
             "error": "instagram_download_failed",
-            "detail": str(error),
         }), 500
 
 
@@ -698,7 +690,6 @@ def instagram_story_extract():
         return jsonify({
             "status": "error",
             "error": error,
-            **({"detail": detail} if detail else {}),
         }), status_code
 
     media_url, ext = choose_media(info)
@@ -935,7 +926,6 @@ def instagram_story_download():
         return jsonify({
             "status": "error",
             "error": error,
-            **({"detail": detail} if detail else {}),
         }), status_code
 
     media_url, _ = choose_media(info)
@@ -1044,8 +1034,6 @@ def instagram_story_download():
         or not os.path.isfile(final_path)
         or os.path.getsize(final_path) == 0
     ):
-        detail = result.stderr[-1500:]
-
         shutil.rmtree(
             temp_dir,
             ignore_errors=True,
@@ -1054,7 +1042,6 @@ def instagram_story_download():
         return jsonify({
             "status": "error",
             "error": "instagram_story_transcode_failed",
-            "detail": detail,
         }), 422
 
     response = send_file(
@@ -1332,7 +1319,6 @@ def extract():
         return jsonify({
             "status": "error",
             "error": "extract_failed",
-            "detail": result.stderr[-1000:],
         }), 422
 
     try:
@@ -1806,7 +1792,6 @@ def facebook_story_extract():
         return jsonify({
             "status": "error",
             "error": error,
-            "detail": detail,
         }), status_code
 
     items = extract_facebook_story_photo_items(html)
@@ -1826,103 +1811,15 @@ def facebook_story_extract():
 
 
 @app.post("/facebook/story/debug")
+
 def facebook_story_debug():
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-
-    if not is_facebook_story_url(url):
-        return jsonify({
-            "status": "error",
-            "error": "invalid_facebook_story_url",
-        }), 400
-
-    cmd = [
-        "yt-dlp",
-        "--no-download",
-        "--no-warnings",
-        "--dump-single-json",
-        url,
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "status": "error",
-            "error": "facebook_story_extract_timeout",
-        }), 504
-
-    if result.returncode != 0:
-        return jsonify({
-            "status": "error",
-            "error": "facebook_story_extract_failed",
-            "detail": result.stderr[-2000:],
-        }), 422
-
-    try:
-        info = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return jsonify({
-            "status": "error",
-            "error": "facebook_story_invalid_response",
-        }), 502
-
-    entries = (
-        info.get("entries")
-        if isinstance(info, dict)
-        else None
-    )
-
-    if not isinstance(entries, list):
-        entries = []
-
-    def summarize(item, index):
-        if not isinstance(item, dict):
-            return None
-
-        media_url, ext = choose_media(item)
-
-        return {
-            "index": index,
-            "id": str(item.get("id") or ""),
-            "title": str(item.get("title") or "")[:120],
-            "ext": ext,
-            "has_media_url": bool(media_url),
-            "webpage_url": str(
-                item.get("webpage_url") or ""
-            )[:300],
-        }
-
-    summarized = []
-
-    for index, entry in enumerate(entries, 1):
-        item = summarize(entry, index)
-
-        if item:
-            summarized.append(item)
-
-    root_media_url, root_ext = choose_media(info)
-
+    """
+    Production diagnostic endpoint intentionally disabled.
+    """
     return jsonify({
-        "status": "ok",
-        "extractor": str(
-            info.get("extractor") or ""
-        ),
-        "extractor_key": str(
-            info.get("extractor_key") or ""
-        ),
-        "root_id": str(info.get("id") or ""),
-        "root_ext": root_ext,
-        "root_has_media_url": bool(root_media_url),
-        "entry_count": len(entries),
-        "entries": summarized,
-    })
+        "status": "error",
+        "error": "not_found",
+    }), 404
 
 
 if __name__ == "__main__":
