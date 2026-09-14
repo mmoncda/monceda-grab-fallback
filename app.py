@@ -32,7 +32,7 @@ def is_instagram_story_url(value):
             parsed.scheme == "https"
             and host == "instagram.com"
             and re.match(
-                r"^/stories/[^/]+/\d+/?$",
+                r"^/stories/[^/]+(?:/\d+)?/?$",
                 parsed.path,
                 re.I,
             )
@@ -156,16 +156,6 @@ def extract_instagram_story_info(url):
         "yt-dlp",
         "--cookies",
         cookie_path,
-        "-f",
-        (
-            "bestvideo[vcodec^=avc1]+"
-            "bestaudio[acodec^=mp4a]/"
-            "bestvideo[vcodec^=avc1]+"
-            "bestaudio[ext=m4a]/"
-            "best[ext=mp4][vcodec^=avc1]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "best[ext=mp4]"
-        ),
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
@@ -241,6 +231,35 @@ def extract_instagram_story_info(url):
 
 
 
+INSTAGRAM_ID_CHARS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789-_"
+)
+
+
+def instagram_pk_to_id(media_id):
+    try:
+        value = int(str(media_id).split("_", 1)[0])
+    except (TypeError, ValueError):
+        return ""
+
+    if value == 0:
+        return INSTAGRAM_ID_CHARS[0]
+
+    encoded = []
+
+    while value:
+        value, remainder = divmod(
+            value,
+            len(INSTAGRAM_ID_CHARS),
+        )
+        encoded.append(INSTAGRAM_ID_CHARS[remainder])
+
+    return "".join(reversed(encoded))
+
+
+
 def is_http_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
@@ -275,6 +294,59 @@ def choose_media(info):
         )
         selected = candidates[0]
         return selected["url"], selected.get("ext") or "mp4"
+
+    # Photo Stories may not expose a video-bearing format.
+    image_exts = {"jpg", "jpeg", "png", "webp", "gif", "avif"}
+
+    image_candidates = [
+        item for item in formats
+        if isinstance(item, dict)
+        and is_http_url(item.get("url"))
+        and str(item.get("ext") or "").lower() in image_exts
+    ]
+
+    if image_candidates:
+        image_candidates.sort(
+            key=lambda item: (
+                item.get("width") or 0,
+                item.get("height") or 0,
+            ),
+            reverse=True,
+        )
+        selected = image_candidates[0]
+        return (
+            selected["url"],
+            str(selected.get("ext") or "jpg").lower(),
+        )
+
+    thumbnail = info.get("thumbnail")
+
+    if is_http_url(thumbnail):
+        clean_url = thumbnail.split("?", 1)[0].lower()
+
+        for image_ext in image_exts:
+            if clean_url.endswith(f".{image_ext}"):
+                return thumbnail, image_ext
+
+        return thumbnail, "jpg"
+
+    thumbnails = info.get("thumbnails") or []
+
+    for item in reversed(thumbnails):
+        if not isinstance(item, dict):
+            continue
+
+        image_url = item.get("url")
+
+        if not is_http_url(image_url):
+            continue
+
+        image_ext = str(item.get("ext") or "").lower()
+
+        if image_ext not in image_exts:
+            image_ext = "jpg"
+
+        return image_url, image_ext
 
     return None, None
 
@@ -526,6 +598,246 @@ def is_instagram_media_url(value):
 
 
 
+def fetch_instagram_raw_story_items(url):
+    """
+    Return Instagram's raw Story items.
+
+    This supplements yt-dlp because Instagram photo Stories may
+    be omitted from yt-dlp's final playlist when they contain no
+    video formats.
+    """
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return []
+
+    try:
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(cookie_path)
+        jar.load(
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+
+        session = requests.Session()
+
+        for cookie in jar:
+            session.cookies.set(
+                cookie.name,
+                cookie.value,
+                domain=cookie.domain,
+                path=cookie.path,
+            )
+
+        browser_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        resolve_cmd = [
+            "yt-dlp",
+            "--cookies",
+            cookie_path,
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ]
+
+        resolve_result = subprocess.run(
+            resolve_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        if resolve_result.returncode != 0:
+            return []
+
+        try:
+            resolved = json.loads(resolve_result.stdout)
+        except Exception:
+            return []
+
+        entries = (
+            resolved.get("entries")
+            if isinstance(resolved, dict)
+            else None
+        )
+
+        candidates = (
+            entries
+            if isinstance(entries, list)
+            else [resolved]
+        )
+
+        user_id = None
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            value = (
+                candidate.get("uploader_id")
+                or candidate.get("channel_id")
+                or candidate.get("playlist_uploader_id")
+            )
+
+            if value:
+                user_id = str(value)
+                break
+
+        if (
+            not user_id
+            and isinstance(resolved, dict)
+        ):
+            value = (
+                resolved.get("uploader_id")
+                or resolved.get("channel_id")
+                or resolved.get("playlist_uploader_id")
+            )
+
+            if value:
+                user_id = str(value)
+
+        if not user_id:
+            return []
+
+        api_headers = {
+            **browser_headers,
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/",
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "359341",
+            "X-IG-WWW-Claim": "0",
+            "Origin": "https://www.instagram.com",
+        }
+
+        api_response = session.get(
+            (
+                "https://www.instagram.com/api/v1/"
+                "feed/reels_media/"
+            ),
+            params={
+                "reel_ids": user_id,
+            },
+            headers=api_headers,
+            timeout=30,
+        )
+
+        if api_response.status_code != 200:
+            return []
+
+        try:
+            payload = api_response.json()
+        except Exception:
+            return []
+
+        reels = payload.get("reels") or {}
+
+        reel = (
+            reels.get(str(user_id))
+            if isinstance(reels, dict)
+            else None
+        )
+
+        items = (
+            reel.get("items") or []
+            if isinstance(reel, dict)
+            else []
+        )
+
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    except Exception:
+        # Raw enrichment is deliberately non-fatal.
+        # Existing yt-dlp Story extraction remains the fallback.
+        return []
+
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+
+
+def choose_instagram_story_photo(raw_item):
+    if not isinstance(raw_item, dict):
+        return None, None
+
+    if raw_item.get("media_type") != 1:
+        return None, None
+
+    candidates = (
+        (
+            raw_item.get("image_versions2")
+            or {}
+        ).get("candidates")
+        or []
+    )
+
+    valid = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        image_url = candidate.get("url")
+
+        if (
+            not is_http_url(image_url)
+            or not is_instagram_media_url(image_url)
+        ):
+            continue
+
+        valid.append(candidate)
+
+    if not valid:
+        return None, None
+
+    valid.sort(
+        key=lambda candidate: (
+            (candidate.get("width") or 0)
+            * (candidate.get("height") or 0),
+            candidate.get("width") or 0,
+            candidate.get("height") or 0,
+        ),
+        reverse=True,
+    )
+
+    image_url = valid[0]["url"]
+
+    clean_url = image_url.split("?", 1)[0].lower()
+
+    image_ext = "jpg"
+
+    for candidate_ext in (
+        "jpeg",
+        "jpg",
+        "png",
+        "webp",
+        "gif",
+        "avif",
+    ):
+        if clean_url.endswith(f".{candidate_ext}"):
+            image_ext = candidate_ext
+            break
+
+    return image_url, image_ext
+
+
+
 @app.post("/instagram/story/debug")
 def instagram_story_debug():
     data = request.get_json(silent=True) or {}
@@ -607,6 +919,47 @@ def instagram_story_debug():
             "ext": obj.get("ext"),
             "vcodec": obj.get("vcodec"),
             "acodec": obj.get("acodec"),
+            "width": obj.get("width"),
+            "height": obj.get("height"),
+            "duration": obj.get("duration"),
+            "format_id": obj.get("format_id"),
+            "format_note": obj.get("format_note"),
+            "protocol": obj.get("protocol"),
+            "thumbnail_present": isinstance(
+                obj.get("thumbnail"),
+                str,
+            ),
+            "thumbnail_host": (
+                urlparse(obj.get("thumbnail")).hostname
+                if isinstance(obj.get("thumbnail"), str)
+                else None
+            ),
+            "thumbnail_count": len(
+                obj.get("thumbnails") or []
+            ),
+            "thumbnails": [
+                {
+                    "id": item.get("id"),
+                    "ext": item.get("ext"),
+                    "width": item.get("width"),
+                    "height": item.get("height"),
+                    "preference": item.get("preference"),
+                    "url_present": isinstance(
+                        item.get("url"),
+                        str,
+                    ),
+                    "url_host": (
+                        urlparse(item.get("url")).hostname
+                        if isinstance(item.get("url"), str)
+                        else None
+                    ),
+                }
+                for item in (obj.get("thumbnails") or [])[:30]
+                if isinstance(item, dict)
+            ],
+            "requested_format_count": len(
+                obj.get("requested_formats") or []
+            ),
             "format_count": len(formats),
             "formats": [
                 {
@@ -643,6 +996,423 @@ def instagram_story_debug():
             if isinstance(entry, dict)
         ],
     })
+
+
+
+@app.post("/instagram/story/raw-debug")
+def instagram_story_raw_debug():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_instagram_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_instagram_story_url",
+        }), 400
+
+    match = re.search(
+        r"/stories/([^/?#]+)",
+        url,
+        re.I,
+    )
+
+    username = (
+        match.group(1)
+        if match
+        else ""
+    )
+
+    if not username or username.lower() == "highlights":
+        return jsonify({
+            "status": "error",
+            "error": "unsupported_story_debug_url",
+        }), 400
+
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_auth_unavailable",
+        }), 503
+
+    try:
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(cookie_path)
+        jar.load(
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+
+        session = requests.Session()
+
+        for cookie in jar:
+            session.cookies.set(
+                cookie.name,
+                cookie.value,
+                domain=cookie.domain,
+                path=cookie.path,
+            )
+
+        browser_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        page_response = session.get(
+            url,
+            headers=browser_headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        page_html = page_response.text or ""
+
+        #
+        # Resolve the Story owner ID using yt-dlp itself.
+        # This avoids fragile HTML regex parsing and mirrors
+        # the extractor already proven to understand the page.
+        #
+        resolve_cmd = [
+            "yt-dlp",
+            "--cookies",
+            cookie_path,
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ]
+
+        resolve_result = subprocess.run(
+            resolve_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        user_id = None
+
+        if resolve_result.returncode == 0:
+            try:
+                resolved = json.loads(
+                    resolve_result.stdout
+                )
+
+                entries = (
+                    resolved.get("entries")
+                    if isinstance(resolved, dict)
+                    else None
+                )
+
+                candidates = (
+                    entries
+                    if isinstance(entries, list)
+                    else [resolved]
+                )
+
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+
+                    value = (
+                        candidate.get("uploader_id")
+                        or candidate.get("channel_id")
+                        or candidate.get("playlist_uploader_id")
+                    )
+
+                    if value:
+                        user_id = str(value)
+                        break
+
+                if (
+                    not user_id
+                    and isinstance(resolved, dict)
+                ):
+                    value = (
+                        resolved.get("uploader_id")
+                        or resolved.get("channel_id")
+                        or resolved.get("playlist_uploader_id")
+                    )
+
+                    if value:
+                        user_id = str(value)
+
+            except Exception:
+                user_id = None
+
+        if not user_id:
+            return jsonify({
+                "status": "error",
+                "error": "instagram_story_user_id_missing",
+                "page_status": page_response.status_code,
+            }), 422
+
+        api_headers = {
+            **browser_headers,
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/",
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "359341",
+            "X-IG-WWW-Claim": "0",
+            "Origin": "https://www.instagram.com",
+        }
+
+        api_response = session.get(
+            (
+                "https://www.instagram.com/api/v1/"
+                "feed/reels_media/"
+            ),
+            params={
+                "reel_ids": user_id,
+            },
+            headers=api_headers,
+            timeout=30,
+        )
+
+        try:
+            payload = api_response.json()
+        except Exception:
+            return jsonify({
+                "status": "error",
+                "error": "instagram_story_api_invalid_json",
+                "api_status": api_response.status_code,
+            }), 502
+
+        reels = payload.get("reels") or {}
+
+        reel = (
+            reels.get(str(user_id))
+            if isinstance(reels, dict)
+            else None
+        )
+
+        items = (
+            reel.get("items") or []
+            if isinstance(reel, dict)
+            else []
+        )
+
+        safe_items = []
+
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+
+            image_candidates = (
+                (
+                    item.get("image_versions2")
+                    or {}
+                ).get("candidates")
+                or []
+            )
+
+            safe_images = []
+
+            for candidate in image_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+
+                image_url = candidate.get("url")
+
+                safe_images.append({
+                    "width": candidate.get("width"),
+                    "height": candidate.get("height"),
+                    "url_present": isinstance(
+                        image_url,
+                        str,
+                    ),
+                    "url_host": (
+                        urlparse(image_url).hostname
+                        if isinstance(image_url, str)
+                        else None
+                    ),
+                })
+
+            safe_items.append({
+                "index": index,
+                "pk": str(item.get("pk") or ""),
+                "media_type": item.get("media_type"),
+                "product_type": item.get("product_type"),
+                "video_duration": item.get("video_duration"),
+                "has_audio": item.get("has_audio"),
+                "video_version_count": len(
+                    item.get("video_versions") or []
+                ),
+                "image_candidate_count": len(
+                    image_candidates
+                ),
+                "images": safe_images[:30],
+            })
+
+        return jsonify({
+            "status": "ok",
+            "page_status": page_response.status_code,
+            "api_status": api_response.status_code,
+            "user_id_present": bool(user_id),
+            "item_count": len(safe_items),
+            "items": safe_items,
+        })
+
+    except Exception as error:
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_raw_debug_failed",
+            "detail": str(error),
+        }), 500
+
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+
+
+@app.post("/instagram/story/web-debug")
+def instagram_story_web_debug():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not is_instagram_story_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "invalid_instagram_story_url",
+        }), 400
+
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_auth_unavailable",
+        }), 503
+
+    try:
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(cookie_path)
+        jar.load(ignore_discard=True, ignore_expires=True)
+
+        session = requests.Session()
+
+        for cookie in jar:
+            session.cookies.set(
+                cookie.name,
+                cookie.value,
+                domain=cookie.domain,
+                path=cookie.path,
+            )
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,image/avif,"
+                "image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        response = session.get(
+            url,
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        html = response.text or ""
+
+        signals = {
+            "reels_media": html.count("reels_media"),
+            "video_versions": html.count("video_versions"),
+            "image_versions2": html.count("image_versions2"),
+            "image_versions": html.count("image_versions"),
+            "story": html.lower().count("story"),
+            "media_type": html.count("media_type"),
+            "pk": html.count('"pk"'),
+            "playable_url": html.count("playable_url"),
+            "display_url": html.count("display_url"),
+            "candidate": html.count("candidates"),
+        }
+
+        safe_hosts = []
+
+        import re
+        from urllib.parse import urlparse
+
+        found_urls = re.findall(
+            r'https?[^"\'\\\s<>]+',
+            html,
+            re.I,
+        )
+
+        for candidate in found_urls:
+            candidate = (
+                candidate
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+            )
+
+            try:
+                host = (
+                    urlparse(candidate).hostname
+                    or ""
+                ).lower()
+            except Exception:
+                continue
+
+            if (
+                host
+                and (
+                    "cdninstagram.com" in host
+                    or "fbcdn.net" in host
+                )
+                and host not in safe_hosts
+            ):
+                safe_hosts.append(host)
+
+            if len(safe_hosts) >= 20:
+                break
+
+        return jsonify({
+            "status": "ok",
+            "http_status": response.status_code,
+            "final_host": (
+                urlparse(response.url).hostname or ""
+            ),
+            "html_length": len(html),
+            "signals": signals,
+            "media_hosts": safe_hosts,
+            "media_host_count": len(safe_hosts),
+            "authenticated_cookie_count": len(
+                list(session.cookies)
+            ),
+        })
+
+    except Exception as error:
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_web_debug_failed",
+            "detail": str(error)[:500],
+        }), 502
+
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+
 
 
 @app.post("/instagram/story/extract")
@@ -693,6 +1463,12 @@ def instagram_story_extract():
 
     if not isinstance(root_entries, list):
         root_entries = []
+
+    #
+    # Preserve every yt-dlp Story entry first. Video extraction
+    # continues to use the existing, already-working path.
+    #
+    yt_items_by_id = {}
 
     for index, entry in enumerate(root_entries):
         if not isinstance(entry, dict):
@@ -745,7 +1521,102 @@ def instagram_story_extract():
         ):
             item["thumbnail"] = item_thumbnail
 
-        story_items.append(item)
+        yt_items_by_id[item_id] = item
+
+    #
+    # Instagram's raw Story response retains media_type.
+    #
+    # media_type == 1 -> original photo candidate
+    # media_type == 2 -> existing yt-dlp video item
+    #
+    # Numeric PK is converted with Instagram's deterministic
+    # base64-style shortcode algorithm, matching yt-dlp.
+    #
+    raw_items = fetch_instagram_raw_story_items(url)
+
+    emitted_ids = set()
+
+    for raw_index, raw_item in enumerate(raw_items, 1):
+        raw_pk = raw_item.get("pk")
+        raw_id = instagram_pk_to_id(raw_pk)
+
+        if not raw_id:
+            continue
+
+        media_type = raw_item.get("media_type")
+
+        if media_type == 1:
+            photo_url, photo_ext = (
+                choose_instagram_story_photo(raw_item)
+            )
+
+            if not photo_url:
+                continue
+
+            photo_item = {
+                "id": raw_id,
+                "index": len(story_items) + 1,
+                "url": photo_url,
+                "ext": photo_ext or "jpg",
+                "filename": (
+                    f"instagram_story_{raw_id}."
+                    f"{photo_ext or 'jpg'}"
+                ),
+                "title": f"Instagram Story {raw_index}",
+                "duration": None,
+            }
+
+            story_items.append(photo_item)
+            emitted_ids.add(raw_id)
+            continue
+
+        existing = yt_items_by_id.get(raw_id)
+
+        if existing:
+            existing = dict(existing)
+            existing["index"] = len(story_items) + 1
+            story_items.append(existing)
+            emitted_ids.add(raw_id)
+
+    #
+    # Fail-safe: if raw API enrichment is incomplete or unavailable,
+    # append any yt-dlp items that were not represented above.
+    #
+    for item_id, item in yt_items_by_id.items():
+        if item_id in emitted_ids:
+            continue
+
+        fallback_item = dict(item)
+        fallback_item["index"] = len(story_items) + 1
+        story_items.append(fallback_item)
+        emitted_ids.add(item_id)
+
+    # For username-level Story URLs, the root response should
+    # represent the first Story in the ordered merged Story list.
+    # Numeric Story URLs retain their existing selected-item behavior.
+    has_numeric_story_id = re.search(
+        r"/stories/[^/]+/\d+/?$",
+        url,
+        re.I,
+    ) is not None
+
+    if story_items and not has_numeric_story_id:
+        first_story = story_items[0]
+
+        media_id = first_story.get("id") or media_id
+        media_url = first_story.get("url") or media_url
+        ext = first_story.get("ext") or ext
+
+        title = (
+            first_story.get("title")
+            or title
+        )
+
+        duration = first_story.get("duration")
+
+        audio_url = first_story.get("audio_url")
+
+        thumbnail = first_story.get("thumbnail")
 
     response = {
         "status": "ok",
@@ -753,7 +1624,7 @@ def instagram_story_extract():
         "instagram_story": True,
         "id": media_id,
         "ext": ext or "mp4",
-        "filename": f"instagram_story_{media_id}.mp4",
+        "filename": f"instagram_story_{media_id}.{ext or 'mp4'}",
         "url": media_url,
         "title": str(
             info.get("title")
@@ -765,7 +1636,7 @@ def instagram_story_extract():
             or info.get("creator")
             or ""
         ).strip(),
-        "duration": info.get("duration"),
+        "duration": duration,
         "upload_date": str(
             info.get("upload_date") or ""
         ).strip(),
@@ -1130,6 +2001,21 @@ def extract():
 
     cookie_path = None
 
+    try:
+        request_path = urlparse(url).path or ""
+    except Exception:
+        request_path = ""
+
+    is_instagram_post = (
+        host == "instagram.com"
+        and re.match(
+            r"^/p/[^/]+/?$",
+            request_path,
+            re.I,
+        )
+        is not None
+    )
+
     cmd = [
         "yt-dlp",
     ]
@@ -1143,13 +2029,32 @@ def extract():
                 cookie_path,
             ])
 
-    cmd.extend([
-        "--no-playlist",
-        "--no-download",
-        "--no-warnings",
-        "--dump-single-json",
-        url,
-    ])
+    if is_instagram_post:
+        #
+        # Instagram photo/carousel posts can contain entries
+        # without conventional video formats. Keep those
+        # entries so their original image metadata can be
+        # normalized below.
+        #
+        cmd.extend([
+            "--ignore-no-formats-error",
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ])
+    else:
+        #
+        # Preserve the existing single-media behavior for
+        # Reels and every other supported platform.
+        #
+        cmd.extend([
+            "--no-playlist",
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ])
 
     try:
         result = subprocess.run(
@@ -1188,13 +2093,144 @@ def extract():
 
     media_url, ext = choose_media(info)
 
+    media_id = str(info.get("id") or "media")
+
+    #
+    # Instagram photo / carousel support.
+    #
+    # yt-dlp can expose image posts and sidecar/carousel entries
+    # without a conventional video stream. Normalize those entries
+    # into the same items[] contract already used by Stories.
+    #
+    instagram_items = []
+
+    if host == "instagram.com":
+        raw_entries = info.get("entries")
+
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+
+        candidates = raw_entries if raw_entries else [info]
+
+        for index, entry in enumerate(candidates, 1):
+            if not isinstance(entry, dict):
+                continue
+
+            entry_url, entry_ext = choose_media(entry)
+
+            thumbnail = entry.get("thumbnail")
+
+            #
+            # Photo posts expose several thumbnail/image
+            # candidates. Prefer the last valid candidate,
+            # which yt-dlp orders as the strongest available
+            # image for these Instagram entries.
+            #
+            if not entry_url:
+                thumbnails = entry.get("thumbnails")
+
+                if isinstance(thumbnails, list):
+                    image_candidates = [
+                        item
+                        for item in thumbnails
+                        if isinstance(item, dict)
+                        and is_instagram_media_url(
+                            item.get("url")
+                        )
+                    ]
+
+                    if image_candidates:
+                        selected_image = image_candidates[-1]
+                        entry_url = selected_image.get("url")
+                        entry_ext = (
+                            str(
+                                selected_image.get("ext")
+                                or entry.get("ext")
+                                or "jpg"
+                            )
+                            .lower()
+                        )
+
+            #
+            # Fallback for single-photo metadata where only
+            # the canonical thumbnail field is available.
+            #
+            if not entry_url and isinstance(thumbnail, str):
+                if is_instagram_media_url(thumbnail):
+                    entry_url = thumbnail
+                    entry_ext = (
+                        str(entry.get("ext") or "jpg")
+                        .lower()
+                    )
+
+            if not entry_url:
+                continue
+
+            clean_ext = str(entry_ext or "mp4").lower()
+
+            media_type = (
+                "image"
+                if clean_ext
+                in {
+                    "jpg",
+                    "jpeg",
+                    "png",
+                    "webp",
+                    "gif",
+                    "avif",
+                }
+                else "video"
+            )
+
+            item_id = str(
+                entry.get("id")
+                or f"{media_id}_{index}"
+            )
+
+            item = {
+                "id": item_id,
+                "index": index,
+                "type": media_type,
+                "ext": clean_ext,
+                "url": entry_url,
+                "filename": (
+                    f"instagram_post_{item_id}."
+                    f"{clean_ext}"
+                ),
+                "title": str(
+                    entry.get("title")
+                    or info.get("title")
+                    or ""
+                ).strip(),
+                "duration": entry.get("duration"),
+            }
+
+            entry_thumbnail = entry.get("thumbnail")
+
+            if (
+                isinstance(entry_thumbnail, str)
+                and is_instagram_media_url(
+                    entry_thumbnail
+                )
+            ):
+                item["thumbnail"] = entry_thumbnail
+
+            instagram_items.append(item)
+
+        #
+        # If no conventional video was selected but Instagram
+        # returned an image item, use the first item as the
+        # top-level media as well.
+        #
+        if not media_url and instagram_items:
+            media_url = instagram_items[0]["url"]
+            ext = instagram_items[0]["ext"]
+
     if not media_url:
         return jsonify({
             "status": "error",
-            "error": "no_video_media",
+            "error": "no_media",
         }), 422
-
-    media_id = str(info.get("id") or "media")
 
     audio_url = (
         choose_audio(info)
@@ -1222,6 +2258,10 @@ def extract():
 
     if audio_url:
         response["audio_url"] = audio_url
+
+    if instagram_items:
+        response["items"] = instagram_items
+        response["item_count"] = len(instagram_items)
 
     return jsonify(response)
 
