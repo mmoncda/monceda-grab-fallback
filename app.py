@@ -1999,8 +1999,6 @@ def extract():
             "error": "unsupported_host",
         }), 400
 
-    cookie_path = None
-
     try:
         request_path = urlparse(url).path or ""
     except Exception:
@@ -2020,14 +2018,10 @@ def extract():
         "yt-dlp",
     ]
 
-    if host == "instagram.com":
-        cookie_path = copy_instagram_story_cookies()
-
-        if cookie_path:
-            cmd.extend([
-                "--cookies",
-                cookie_path,
-            ])
+    # Public extraction must never inherit Monceda Grab's
+    # authenticated Instagram session. If media cannot be
+    # resolved anonymously, /extract must fail closed instead
+    # of expanding the caller's access through server cookies.
 
     if is_instagram_post:
         #
@@ -2069,12 +2063,6 @@ def extract():
             "status": "error",
             "error": "extract_timeout",
         }), 504
-    finally:
-        if cookie_path:
-            try:
-                os.remove(cookie_path)
-            except OSError:
-                pass
 
     if result.returncode != 0:
         return jsonify({
