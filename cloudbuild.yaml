@@ -7,7 +7,7 @@ steps:
       - |
         python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
         MONCEDA_PROCESSOR_TOKEN=monceda-ci-test-token \
-          python -m unittest -v test_processor_contract.py
+          python -m unittest -v test_processor_contract.py test_processor_media.py
 
   - id: build
     name: gcr.io/cloud-builders/docker

@@ -774,6 +774,8 @@ def instagram_story_extract():
 
     media_id = str(info.get("id") or "story")
 
+    duration = info.get("duration")
+
     story_items = []
 
     root_entries = info.get("_monceda_root_entries")
