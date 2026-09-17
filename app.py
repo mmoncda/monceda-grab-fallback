@@ -1336,8 +1336,15 @@ def instagram_story_download():
 @app.post("/instagram/normalize")
 def instagram_normalize():
     data = request.get_json(silent=True) or {}
-    media_url = str(data.get("url", "")).strip()
-    audio_url = str(data.get("audio_url", "")).strip()
+
+    media_url = str(
+        data.get("url", "")
+    ).strip()
+
+    audio_url = str(
+        data.get("audio_url", "")
+    ).strip()
+
     fast_remux = data.get("fast_remux") is True
 
     if not is_instagram_media_url(media_url):
@@ -1346,17 +1353,39 @@ def instagram_normalize():
             "error": "invalid_media_url",
         }), 400
 
-    if audio_url and not is_instagram_media_url(audio_url):
+    if (
+        audio_url
+        and not is_instagram_media_url(audio_url)
+    ):
         return jsonify({
             "status": "error",
             "error": "invalid_audio_url",
         }), 400
+
+    #
+    # Safari video elements depend on byte-range requests.
+    #
+    # Streaming FFmpeg directly through pipe:1 cannot provide
+    # a stable Content-Length / Content-Range contract.
+    #
+    # Normalize into a temporary fast-start MP4 first, then
+    # serve either the whole file or the requested byte range.
+    #
+    temp_dir = tempfile.mkdtemp(
+        prefix="monceda-instagram-normalize-"
+    )
+
+    final_path = os.path.join(
+        temp_dir,
+        "instagram-video.mp4",
+    )
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
+        "-y",
         "-threads",
         "2",
         "-i",
@@ -1399,10 +1428,8 @@ def instagram_normalize():
             "-c:a",
             "copy",
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
-            "-f",
-            "mp4",
-            "pipe:1",
+            "+faststart",
+            final_path,
         ]
     else:
         cmd += [
@@ -1416,65 +1443,226 @@ def instagram_normalize():
             "20",
             "-pix_fmt",
             "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.1",
             "-threads",
             "2",
-
             "-c:a",
             "aac",
             "-b:a",
             "96k",
-
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
-            "-f",
-            "mp4",
-            "pipe:1",
+            "+faststart",
+            final_path,
         ]
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=0,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
 
-    def generate():
+        return jsonify({
+            "status": "error",
+            "error": "instagram_normalize_timeout",
+        }), 504
+
+    if (
+        result.returncode != 0
+        or not os.path.isfile(final_path)
+        or os.path.getsize(final_path) == 0
+    ):
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_normalize_failed",
+        }), 422
+
+    file_size = os.path.getsize(final_path)
+
+    range_header = (
+        request.headers.get("Range", "")
+        or ""
+    ).strip()
+
+    start = 0
+    end = file_size - 1
+    status_code = 200
+
+    if range_header:
+        match = re.fullmatch(
+            r"bytes=(\d*)-(\d*)",
+            range_header,
+        )
+
+        if not match:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            response = Response(
+                "Invalid range",
+                status=416,
+            )
+
+            response.headers["Content-Range"] = (
+                f"bytes */{file_size}"
+            )
+            response.headers["Accept-Ranges"] = "bytes"
+
+            return response
+
+        first, last = match.groups()
+
         try:
-            while True:
-                chunk = process.stdout.read(256 * 1024)
+            if first:
+                start = int(first)
 
-                if not chunk:
-                    break
+                if last:
+                    end = int(last)
+                else:
+                    end = file_size - 1
 
-                yield chunk
+            elif last:
+                suffix_length = int(last)
+
+                if suffix_length <= 0:
+                    raise ValueError
+
+                start = max(
+                    file_size - suffix_length,
+                    0,
+                )
+                end = file_size - 1
+
+            else:
+                raise ValueError
+
+        except ValueError:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            response = Response(
+                "Invalid range",
+                status=416,
+            )
+
+            response.headers["Content-Range"] = (
+                f"bytes */{file_size}"
+            )
+            response.headers["Accept-Ranges"] = "bytes"
+
+            return response
+
+        if (
+            start < 0
+            or start >= file_size
+            or end < start
+        ):
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            response = Response(
+                "Range not satisfiable",
+                status=416,
+            )
+
+            response.headers["Content-Range"] = (
+                f"bytes */{file_size}"
+            )
+            response.headers["Accept-Ranges"] = "bytes"
+
+            return response
+
+        end = min(
+            end,
+            file_size - 1,
+        )
+
+        status_code = 206
+
+    content_length = end - start + 1
+
+    def generate_file():
+        try:
+            with open(final_path, "rb") as handle:
+                handle.seek(start)
+
+                remaining = content_length
+
+                while remaining > 0:
+                    chunk = handle.read(
+                        min(
+                            256 * 1024,
+                            remaining,
+                        )
+                    )
+
+                    if not chunk:
+                        break
+
+                    remaining -= len(chunk)
+
+                    yield chunk
+
         finally:
-            if process.stdout:
-                process.stdout.close()
-
-            if process.poll() is None:
-                process.terminate()
-
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
 
     response = Response(
-        generate(),
+        generate_file(),
+        status=status_code,
         mimetype="video/mp4",
         direct_passthrough=True,
     )
 
-    response.headers["Content-Disposition"] = (
-        'attachment; filename="instagram-video.mp4"'
+    response.headers["Content-Length"] = str(
+        content_length
     )
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["X-Monceda-Instagram"] = "h264-stream"
 
-    if fast_remux:
-        response.headers[
-            "X-Monceda-Instagram"
-        ] = "h264-aac-fast-compatible"
+    response.headers["Accept-Ranges"] = "bytes"
+
+    if status_code == 206:
+        response.headers["Content-Range"] = (
+            f"bytes {start}-{end}/{file_size}"
+        )
+
+    response.headers["Content-Disposition"] = (
+        'inline; filename="instagram-video.mp4"'
+    )
+
+    response.headers["Cache-Control"] = (
+        "private, no-store"
+    )
+
+    response.headers[
+        "X-Monceda-Instagram"
+    ] = (
+        "h264-aac-fast-compatible"
+        if fast_remux
+        else "h264-range-compatible"
+    )
 
     return response
 
