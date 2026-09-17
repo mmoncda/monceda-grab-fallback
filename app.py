@@ -76,6 +76,34 @@ def enforce_processor_auth():
 URL_RE = re.compile(r"^https?://", re.I)
 
 
+INSTAGRAM_COOKIE_SECRET_PATH = os.environ.get(
+    "INSTAGRAM_COOKIE_SECRET_PATH",
+    "/secrets/instagram/cookies.txt",
+)
+
+
+
+
+
+def copy_instagram_story_cookies(destination_dir=None):
+    source = INSTAGRAM_COOKIE_SECRET_PATH
+
+    if not os.path.isfile(source):
+        return None
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix="monceda-instagram-story-cookies-",
+        suffix=".txt",
+        dir=destination_dir,
+    )
+    os.close(fd)
+
+    shutil.copyfile(source, temp_path)
+    os.chmod(temp_path, 0o600)
+
+    return temp_path
+
+
 def is_instagram_story_url(value):
     try:
         parsed = urlparse(value)
@@ -180,15 +208,20 @@ def select_instagram_story_info(info, url):
 
 
 def extract_instagram_story_info(url):
-    """
-    Extract only Stories that Instagram exposes without using
-    Monceda Grab's authenticated account session.
+    cookie_path = copy_instagram_story_cookies()
 
-    If Instagram requires authentication, fail closed instead
-    of expanding the caller's access through server credentials.
-    """
+    if not cookie_path:
+        return (
+            None,
+            "instagram_story_auth_unavailable",
+            "",
+            503,
+        )
+
     cmd = [
         "yt-dlp",
+        "--cookies",
+        cookie_path,
         "--no-download",
         "--no-warnings",
         "--dump-single-json",
@@ -210,12 +243,17 @@ def extract_instagram_story_info(url):
             "",
             504,
         )
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         return (
             None,
-            "instagram_story_public_unavailable",
-            "",
+            "instagram_story_extract_failed",
+            result.stderr[-1500:],
             422,
         )
 
@@ -250,7 +288,7 @@ def extract_instagram_story_info(url):
     if not isinstance(info, dict):
         return (
             None,
-            "instagram_story_public_unavailable",
+            "instagram_story_media_missing",
             "",
             422,
         )
@@ -616,14 +654,176 @@ def is_instagram_media_url(value):
 
 def fetch_instagram_raw_story_items(url):
     """
-    Authenticated Instagram Story API enrichment is intentionally
-    disabled for the public Monceda Grab service.
+    Return Instagram's raw Story items.
 
-    Anonymous yt-dlp output remains the only Story source. This
-    means some photo Stories may be unavailable rather than using
-    Monceda Grab's account session to expand access.
+    This supplements yt-dlp because Instagram photo Stories may
+    be omitted from yt-dlp's final playlist when they contain no
+    video formats.
     """
-    return []
+    cookie_path = copy_instagram_story_cookies()
+
+    if not cookie_path:
+        return []
+
+    try:
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(cookie_path)
+        jar.load(
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+
+        session = requests.Session()
+
+        for cookie in jar:
+            session.cookies.set(
+                cookie.name,
+                cookie.value,
+                domain=cookie.domain,
+                path=cookie.path,
+            )
+
+        browser_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        resolve_cmd = [
+            "yt-dlp",
+            "--cookies",
+            cookie_path,
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ]
+
+        resolve_result = subprocess.run(
+            resolve_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        if resolve_result.returncode != 0:
+            return []
+
+        try:
+            resolved = json.loads(resolve_result.stdout)
+        except Exception:
+            return []
+
+        entries = (
+            resolved.get("entries")
+            if isinstance(resolved, dict)
+            else None
+        )
+
+        candidates = (
+            entries
+            if isinstance(entries, list)
+            else [resolved]
+        )
+
+        user_id = None
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            value = (
+                candidate.get("uploader_id")
+                or candidate.get("channel_id")
+                or candidate.get("playlist_uploader_id")
+            )
+
+            if value:
+                user_id = str(value)
+                break
+
+        if (
+            not user_id
+            and isinstance(resolved, dict)
+        ):
+            value = (
+                resolved.get("uploader_id")
+                or resolved.get("channel_id")
+                or resolved.get("playlist_uploader_id")
+            )
+
+            if value:
+                user_id = str(value)
+
+        if not user_id:
+            return []
+
+        api_headers = {
+            **browser_headers,
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/",
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "359341",
+            "X-IG-WWW-Claim": "0",
+            "Origin": "https://www.instagram.com",
+        }
+
+        api_response = session.get(
+            (
+                "https://www.instagram.com/api/v1/"
+                "feed/reels_media/"
+            ),
+            params={
+                "reel_ids": user_id,
+            },
+            headers=api_headers,
+            timeout=30,
+        )
+
+        if api_response.status_code != 200:
+            return []
+
+        try:
+            payload = api_response.json()
+        except Exception:
+            return []
+
+        reels = payload.get("reels") or {}
+
+        reel = (
+            reels.get(str(user_id))
+            if isinstance(reels, dict)
+            else None
+        )
+
+        items = (
+            reel.get("items") or []
+            if isinstance(reel, dict)
+            else []
+        )
+
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    except Exception:
+        # Raw enrichment is deliberately non-fatal.
+        # Existing yt-dlp Story extraction remains the fallback.
+        return []
+
+    finally:
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
 
 
 def choose_instagram_story_photo(raw_item):
