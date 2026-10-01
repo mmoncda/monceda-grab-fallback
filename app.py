@@ -11,6 +11,17 @@ from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
 
+PROCESSOR_DIR = os.path.dirname(os.path.abspath(__file__))
+PROCESSOR_YTDLP = os.path.join(
+    PROCESSOR_DIR,
+    ".venv",
+    "bin",
+    "yt-dlp",
+)
+
+if not os.path.isfile(PROCESSOR_YTDLP):
+    PROCESSOR_YTDLP = shutil.which("yt-dlp") or "yt-dlp"
+
 PROCESSOR_TOKEN_ENV = "MONCEDA_PROCESSOR_TOKEN"
 PROCESSOR_TOKEN_HEADER = "X-Monceda-Processor-Token"
 
@@ -219,7 +230,7 @@ def extract_instagram_story_info(url):
         )
 
     cmd = [
-        "yt-dlp",
+        PROCESSOR_YTDLP,
         "--cookies",
         cookie_path,
         "--no-download",
@@ -250,6 +261,22 @@ def extract_instagram_story_info(url):
             pass
 
     if result.returncode != 0:
+        import re
+        safe_lines = []
+        for line in result.stderr[-3000:].splitlines():
+            if line.count("\t") >= 6 or re.search(
+                r"""(?:authorization|cookie|token|sessionid|csrftoken|password)["']?\s*[:=]""",
+                line, re.I,
+            ):
+                safe_lines.append("[Sensitive diagnostic line omitted]")
+                continue
+            safe_lines.append(
+                re.sub(r"https?://\S+", "[URL]", line)
+            )
+        app.logger.warning(
+            "Instagram Story extractor diagnostic: %s",
+            "\n".join(safe_lines)[-1500:],
+        )
         return (
             None,
             "instagram_story_extract_failed",
@@ -652,6 +679,238 @@ def is_instagram_media_url(value):
         return False
 
 
+def resolve_instagram_story_user_id(
+    url,
+    session,
+    browser_headers,
+    cookie_path,
+):
+    """
+    Resolve the Story owner's numeric Instagram user ID.
+
+    Resolution order:
+      1. Local non-secret username -> user_id cache
+      2. Instagram web_profile_info
+      3. yt-dlp compatibility fallback
+
+    Cookie/session values are never logged or cached.
+    """
+    try:
+        parts = [
+            part
+            for part in urlparse(url).path.split("/")
+            if part
+        ]
+
+        if (
+            len(parts) < 2
+            or parts[0].lower() != "stories"
+        ):
+            return None
+
+        username = parts[1].strip()
+
+        if not username:
+            return None
+
+        cache_dir = os.path.join(
+            os.path.dirname(PROCESSOR_DIR),
+            ".secrets",
+            "instagram",
+        )
+
+        cache_path = os.path.join(
+            cache_dir,
+            "user-ids.json",
+        )
+
+        cache = {}
+
+        try:
+            if os.path.isfile(cache_path):
+                with open(
+                    cache_path,
+                    "r",
+                    encoding="utf-8",
+                ) as handle:
+                    loaded = json.load(handle)
+
+                if isinstance(loaded, dict):
+                    cache = loaded
+        except Exception:
+            cache = {}
+
+        cached_user_id = str(
+            cache.get(username.lower()) or ""
+        ).strip()
+
+        if cached_user_id.isdigit():
+            return cached_user_id
+
+        profile_headers = {
+            **browser_headers,
+            "Accept": "*/*",
+            "Referer": (
+                f"https://www.instagram.com/{username}/"
+            ),
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "359341",
+            "X-IG-WWW-Claim": "0",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        try:
+            response = session.get(
+                (
+                    "https://www.instagram.com/api/v1/"
+                    "users/web_profile_info/"
+                ),
+                params={
+                    "username": username,
+                },
+                headers=profile_headers,
+                timeout=20,
+            )
+
+            if response.status_code == 200:
+                payload = response.json()
+
+                user = (
+                    ((payload.get("data") or {}).get("user") or {})
+                    if isinstance(payload, dict)
+                    else {}
+                )
+
+                user_id = str(
+                    user.get("id") or ""
+                ).strip()
+
+                if user_id.isdigit():
+                    try:
+                        os.makedirs(
+                            cache_dir,
+                            exist_ok=True,
+                        )
+
+                        cache[username.lower()] = user_id
+
+                        temp_cache = (
+                            cache_path + ".tmp"
+                        )
+
+                        with open(
+                            temp_cache,
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
+                            json.dump(
+                                cache,
+                                handle,
+                                indent=2,
+                                sort_keys=True,
+                            )
+
+                        os.replace(
+                            temp_cache,
+                            cache_path,
+                        )
+                    except Exception:
+                        pass
+
+                    return user_id
+
+            elif response.status_code == 429:
+                app.logger.warning(
+                    "Instagram profile resolver rate limited"
+                )
+
+        except Exception:
+            pass
+
+        #
+        # Compatibility fallback only.
+        #
+        # This may fail while Instagram's yt-dlp extractor is
+        # broken, but retaining it allows recovery automatically
+        # when upstream yt-dlp support returns.
+        #
+        resolve_cmd = [
+            PROCESSOR_YTDLP,
+            "--cookies",
+            cookie_path,
+            "--no-download",
+            "--no-warnings",
+            "--dump-single-json",
+            url,
+        ]
+
+        result = subprocess.run(
+            resolve_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        try:
+            resolved = json.loads(result.stdout)
+        except Exception:
+            return None
+
+        entries = (
+            resolved.get("entries")
+            if isinstance(resolved, dict)
+            else None
+        )
+
+        candidates = (
+            entries
+            if isinstance(entries, list)
+            else [resolved]
+        )
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            value = (
+                candidate.get("uploader_id")
+                or candidate.get("channel_id")
+                or candidate.get(
+                    "playlist_uploader_id"
+                )
+            )
+
+            if value:
+                user_id = str(value).strip()
+
+                if user_id.isdigit():
+                    return user_id
+
+        if isinstance(resolved, dict):
+            value = (
+                resolved.get("uploader_id")
+                or resolved.get("channel_id")
+                or resolved.get(
+                    "playlist_uploader_id"
+                )
+            )
+
+            if value:
+                user_id = str(value).strip()
+
+                if user_id.isdigit():
+                    return user_id
+
+    except Exception:
+        pass
+
+    return None
+
+
 def fetch_instagram_raw_story_items(url):
     """
     Return Instagram's raw Story items.
@@ -694,72 +953,264 @@ def fetch_instagram_raw_story_items(url):
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        resolve_cmd = [
-            "yt-dlp",
-            "--cookies",
-            cookie_path,
-            "--no-download",
-            "--no-warnings",
-            "--dump-single-json",
-            url,
-        ]
-
-        resolve_result = subprocess.run(
-            resolve_cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-
-        if resolve_result.returncode != 0:
-            return []
+        #
+        # Numeric Story URLs already contain the Instagram media PK.
+        # Resolve these directly through media/<pk>/info/ before any
+        # username/user-ID lookup or yt-dlp fallback.
+        #
+        story_pk = ""
 
         try:
-            resolved = json.loads(resolve_result.stdout)
+            parts = [
+                part
+                for part in urlparse(url).path.split("/")
+                if part
+            ]
+
+            if (
+                len(parts) >= 3
+                and parts[0].lower() == "stories"
+                and parts[2].isdigit()
+            ):
+                story_pk = parts[2]
         except Exception:
-            return []
+            story_pk = ""
 
-        entries = (
-            resolved.get("entries")
-            if isinstance(resolved, dict)
-            else None
-        )
+        if story_pk:
+            media_headers = {
+                **browser_headers,
+                "Accept": "*/*",
+                "Referer": "https://www.instagram.com/",
+                "Origin": "https://www.instagram.com",
+                "X-IG-App-ID": "936619743392459",
+                "X-ASBD-ID": "359341",
+                "X-IG-WWW-Claim": "0",
+            }
 
-        candidates = (
-            entries
-            if isinstance(entries, list)
-            else [resolved]
-        )
-
-        user_id = None
-
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-
-            value = (
-                candidate.get("uploader_id")
-                or candidate.get("channel_id")
-                or candidate.get("playlist_uploader_id")
+            media_response = session.get(
+                (
+                    "https://www.instagram.com/api/v1/media/"
+                    f"{story_pk}/info/"
+                ),
+                headers=media_headers,
+                timeout=30,
             )
 
-            if value:
-                user_id = str(value)
-                break
+            if media_response.status_code == 200:
+                try:
+                    media_payload = media_response.json()
+                except Exception:
+                    media_payload = {}
 
-        if (
-            not user_id
-            and isinstance(resolved, dict)
-        ):
-            value = (
-                resolved.get("uploader_id")
-                or resolved.get("channel_id")
-                or resolved.get("playlist_uploader_id")
-            )
+                media_items = (
+                    media_payload.get("items") or []
+                    if isinstance(media_payload, dict)
+                    else []
+                )
 
-            if value:
-                user_id = str(value)
+                matching_items = [
+                    item
+                    for item in media_items
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("pk") or "")
+                        == story_pk
+                    )
+                ]
+
+                if matching_items:
+                    #
+                    # The numeric Story gives us a reliable owner ID.
+                    # Instagram's web GraphQL endpoint exposes the
+                    # owner's complete active Story reel using web
+                    # session cookies. Resolve every discovered Story
+                    # ID again through media/<id>/info/, which is the
+                    # already-proven raw media source in this service.
+                    #
+                    owner = matching_items[0].get("user") or {}
+
+                    owner_id = str(
+                        owner.get("pk")
+                        or owner.get("id")
+                        or ""
+                    ).strip()
+
+                    if owner_id:
+                        try:
+                            import json as _story_json
+
+                            graphql_headers = {
+                                **browser_headers,
+                                "Accept": "*/*",
+                                "Referer": (
+                                    "https://www.instagram.com/"
+                                ),
+                                "X-IG-App-ID": (
+                                    "936619743392459"
+                                ),
+                                "X-Requested-With": (
+                                    "XMLHttpRequest"
+                                ),
+                            }
+
+                            graphql_response = session.get(
+                                (
+                                    "https://www.instagram.com/"
+                                    "graphql/query/"
+                                ),
+                                params={
+                                    "query_hash": (
+                                        "303a4ae99711322310f25250d988f3b7"
+                                    ),
+                                    "variables": (
+                                        _story_json.dumps(
+                                            {
+                                                "reel_ids": [
+                                                    owner_id
+                                                ],
+                                                "precomposed_overlay": False,
+                                            },
+                                            separators=(",", ":"),
+                                        )
+                                    ),
+                                },
+                                headers=graphql_headers,
+                                timeout=30,
+                            )
+
+                            graphql_payload = (
+                                graphql_response.json()
+                                if graphql_response.status_code == 200
+                                else {}
+                            )
+
+                            graphql_data = (
+                                graphql_payload.get("data") or {}
+                                if isinstance(
+                                    graphql_payload,
+                                    dict,
+                                )
+                                else {}
+                            )
+
+                            reels_media = (
+                                graphql_data.get(
+                                    "reels_media"
+                                ) or []
+                                if isinstance(
+                                    graphql_data,
+                                    dict,
+                                )
+                                else []
+                            )
+
+                            discovered_ids = []
+
+                            for reel in reels_media:
+                                if not isinstance(reel, dict):
+                                    continue
+
+                                for story in (
+                                    reel.get("items") or []
+                                ):
+                                    if not isinstance(
+                                        story,
+                                        dict,
+                                    ):
+                                        continue
+
+                                    story_id = str(
+                                        story.get("id")
+                                        or story.get("pk")
+                                        or ""
+                                    ).split("_", 1)[0].strip()
+
+                                    if (
+                                        story_id.isdigit()
+                                        and story_id
+                                        not in discovered_ids
+                                    ):
+                                        discovered_ids.append(
+                                            story_id
+                                        )
+
+                            resolved_items = []
+
+                            for discovered_id in discovered_ids:
+                                item_response = session.get(
+                                    (
+                                        "https://www.instagram.com/"
+                                        "api/v1/media/"
+                                        f"{discovered_id}/info/"
+                                    ),
+                                    headers=media_headers,
+                                    timeout=30,
+                                )
+
+                                if (
+                                    item_response.status_code
+                                    != 200
+                                ):
+                                    continue
+
+                                try:
+                                    item_payload = (
+                                        item_response.json()
+                                    )
+                                except Exception:
+                                    continue
+
+                                for resolved in (
+                                    item_payload.get(
+                                        "items"
+                                    ) or []
+                                ):
+                                    if (
+                                        isinstance(
+                                            resolved,
+                                            dict,
+                                        )
+                                        and str(
+                                            resolved.get(
+                                                "pk"
+                                            )
+                                            or ""
+                                        ).split(
+                                            "_",
+                                            1,
+                                        )[0]
+                                        == discovered_id
+                                    ):
+                                        resolved_items.append(
+                                            resolved
+                                        )
+                                        break
+
+                            if resolved_items:
+                                return resolved_items
+
+                        except Exception:
+                            pass
+
+                    # Fail-safe: preserve the originally requested
+                    # Story when full-reel discovery is unavailable.
+                    return matching_items
+
+            elif media_response.status_code == 429:
+                app.logger.warning(
+                    "Instagram Story media info rate limited"
+                )
+
+        #
+        # Username-level Story URL fallback:
+        # resolve owner -> reels_media.
+        #
+        user_id = resolve_instagram_story_user_id(
+            url,
+            session,
+            browser_headers,
+            cookie_path,
+        )
 
         if not user_id:
             return []
@@ -891,6 +1342,150 @@ def choose_instagram_story_photo(raw_item):
     return image_url, image_ext
 
 
+def choose_instagram_story_video(raw_item):
+    if not isinstance(raw_item, dict):
+        return None, None
+
+    if raw_item.get("media_type") != 2:
+        return None, None
+
+    versions = raw_item.get("video_versions") or []
+
+    valid = []
+
+    for version in versions:
+        if not isinstance(version, dict):
+            continue
+
+        video_url = version.get("url")
+
+        if (
+            not is_http_url(video_url)
+            or not is_instagram_media_url(video_url)
+        ):
+            continue
+
+        valid.append(version)
+
+    if not valid:
+        return None, None
+
+    valid.sort(
+        key=lambda version: (
+            (version.get("width") or 0)
+            * (version.get("height") or 0),
+            version.get("width") or 0,
+            version.get("height") or 0,
+        ),
+        reverse=True,
+    )
+
+    return valid[0]["url"], "mp4"
+
+
+def normalize_instagram_raw_story_items(raw_items):
+    normalized = []
+
+    for raw_index, raw_item in enumerate(
+        raw_items,
+        1,
+    ):
+        if not isinstance(raw_item, dict):
+            continue
+
+        raw_pk = raw_item.get("pk")
+
+        raw_id = instagram_pk_to_id(raw_pk)
+
+        if not raw_id:
+            continue
+
+        media_type = raw_item.get("media_type")
+
+        media_url = None
+        ext = None
+        item_type = None
+
+        if media_type == 1:
+            media_url, ext = (
+                choose_instagram_story_photo(
+                    raw_item
+                )
+            )
+            item_type = "image"
+
+        elif media_type == 2:
+            media_url, ext = (
+                choose_instagram_story_video(
+                    raw_item
+                )
+            )
+            item_type = "video"
+
+        if not media_url:
+            continue
+
+        item = {
+            "id": raw_id,
+            "pk": str(raw_pk or ""),
+            "index": len(normalized) + 1,
+            "type": item_type,
+            "url": media_url,
+            "ext": ext or (
+                "jpg"
+                if item_type == "image"
+                else "mp4"
+            ),
+            "filename": (
+                f"instagram_story_{raw_id}."
+                f"{ext or ('jpg' if item_type == 'image' else 'mp4')}"
+            ),
+            "title": (
+                f"Instagram Story {raw_index}"
+            ),
+            "duration": (
+                raw_item.get("video_duration")
+                if item_type == "video"
+                else None
+            ),
+        }
+
+        image_versions = (
+            (
+                raw_item.get("image_versions2")
+                or {}
+            ).get("candidates")
+            or []
+        )
+
+        if image_versions:
+            thumbnail_candidates = [
+                candidate
+                for candidate in image_versions
+                if isinstance(candidate, dict)
+                and is_instagram_media_url(
+                    candidate.get("url")
+                )
+            ]
+
+            if thumbnail_candidates:
+                thumbnail_candidates.sort(
+                    key=lambda candidate: (
+                        (candidate.get("width") or 0)
+                        * (candidate.get("height") or 0)
+                    ),
+                    reverse=True,
+                )
+
+                item["thumbnail"] = (
+                    thumbnail_candidates[0]["url"]
+                )
+
+        normalized.append(item)
+
+    return normalized
+
+
 @app.post("/instagram/story/debug")
 
 def instagram_story_debug():
@@ -933,6 +1528,62 @@ def instagram_story_web_debug():
     }), 404
 
 
+
+def classify_instagram_story_failure(detail):
+    """
+    Return a safe failure category without exposing
+    cookies, URLs, tokens, or extractor stderr.
+    """
+    message = str(detail or "").lower()
+
+    if any(value in message for value in (
+        "429",
+        "too many requests",
+        "rate limit",
+    )):
+        return "rate_limited"
+
+    if any(value in message for value in (
+        "login required",
+        "login to",
+        "you need to log in",
+        "authentication required",
+        "cookies are no longer valid",
+    )):
+        return "authentication_required"
+
+    if any(value in message for value in (
+        "403 forbidden",
+        "http error 403",
+        "access denied",
+    )):
+        return "access_denied"
+
+    if any(value in message for value in (
+        "timed out",
+        "timeout",
+    )):
+        return "network_timeout"
+
+    if any(value in message for value in (
+        "connection error",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+    )):
+        return "network_error"
+
+    if any(value in message for value in (
+        "private",
+        "not available",
+        "unavailable",
+        "not found",
+    )):
+        return "media_unavailable"
+
+    return "extractor_error"
+
+
 @app.post("/instagram/story/extract")
 def instagram_story_extract():
     data = request.get_json(silent=True) or {}
@@ -944,27 +1595,113 @@ def instagram_story_extract():
             "error": "invalid_instagram_story_url",
         }), 400
 
+    #
+    # RAW-FIRST INSTAGRAM STORY PATH
+    #
+    # Avoid depending on yt-dlp when Instagram's Story extractor
+    # is temporarily broken. If raw extraction cannot resolve the
+    # Story, the existing yt-dlp implementation remains untouched
+    # as the fallback below.
+    #
+    raw_items = fetch_instagram_raw_story_items(url)
+
+    raw_story_items = (
+        normalize_instagram_raw_story_items(
+            raw_items
+        )
+    )
+
+    if raw_story_items:
+        requested_story_pk = ""
+
+        try:
+            parts = [
+                part
+                for part in urlparse(url).path.split("/")
+                if part
+            ]
+
+            if len(parts) >= 3:
+                requested_story_pk = parts[2]
+        except Exception:
+            requested_story_pk = ""
+
+        selected = None
+
+        if requested_story_pk:
+            for item in raw_story_items:
+                if (
+                    item.get("pk")
+                    == requested_story_pk
+                ):
+                    selected = item
+                    break
+
+        if selected is None:
+            selected = raw_story_items[0]
+
+        username = ""
+
+        try:
+            parts = [
+                part
+                for part in urlparse(url).path.split("/")
+                if part
+            ]
+
+            if len(parts) >= 2:
+                username = parts[1]
+        except Exception:
+            username = ""
+
+        response = {
+            "status": "ok",
+            "engine": "instagram-raw",
+            "instagram_story": True,
+            "id": selected["id"],
+            "ext": selected["ext"],
+            "filename": selected["filename"],
+            "url": selected["url"],
+            "title": selected["title"],
+            "author": username,
+            "duration": selected.get("duration"),
+            "items": raw_story_items,
+            "item_count": len(raw_story_items),
+        }
+
+        if selected.get("thumbnail"):
+            response["thumbnail"] = (
+                selected["thumbnail"]
+            )
+
+        return jsonify(response)
+
     info, error, detail, status_code = (
         extract_instagram_story_info(url)
     )
 
     if error:
-        return jsonify({
+        response = {
             "status": "error",
             "error": error,
-        }), status_code
+        }
+
+        if error == "instagram_story_extract_failed":
+            reason = classify_instagram_story_failure(
+                detail
+            )
+
+            app.logger.warning(
+                "Instagram Story extraction: %s",
+                reason,
+            )
+
+            response["reason"] = reason
+
+        return jsonify(response), status_code
 
     media_url, ext = choose_media(info)
     audio_url = choose_audio(info)
-
-    if (
-        not media_url
-        or not is_instagram_media_url(media_url)
-    ):
-        return jsonify({
-            "status": "error",
-            "error": "instagram_story_media_missing",
-        }), 422
 
     if (
         audio_url
@@ -1137,6 +1874,15 @@ def instagram_story_extract():
 
         thumbnail = first_story.get("thumbnail")
 
+    # Validate after merging all available Story items.
+    # Username-level Story URLs may resolve to a photo
+    # even when the initial yt-dlp media has no video URL.
+    if not media_url or not is_instagram_media_url(media_url):
+        return jsonify({
+            "status": "error",
+            "error": "instagram_story_media_missing",
+        }), 422
+
     response = {
         "status": "ok",
         "engine": "yt-dlp",
@@ -1182,18 +1928,72 @@ def instagram_story_download():
             "error": "invalid_instagram_story_url",
         }), 400
 
-    info, error, detail, status_code = (
-        extract_instagram_story_info(url)
-    )
+    #
+    # Prefer the same raw Instagram path already used successfully
+    # by /instagram/story/extract.  The old yt-dlp resolver remains
+    # as a compatibility fallback.
+    #
+    media_url = None
+    audio_url = None
 
-    if error:
-        return jsonify({
-            "status": "error",
-            "error": error,
-        }), status_code
+    try:
+        raw_items = fetch_instagram_raw_story_items(url)
+        normalized_items = normalize_instagram_raw_story_items(
+            raw_items
+        )
+    except Exception:
+        normalized_items = []
 
-    media_url, _ = choose_media(info)
-    audio_url = choose_audio(info)
+    requested_story_pk = ""
+
+    try:
+        parts = [
+            part
+            for part in urlparse(url).path.split("/")
+            if part
+        ]
+
+        if (
+            len(parts) >= 3
+            and parts[0].lower() == "stories"
+            and parts[2].isdigit()
+        ):
+            requested_story_pk = parts[2]
+    except Exception:
+        requested_story_pk = ""
+
+    selected_raw = None
+
+    if normalized_items:
+        if requested_story_pk:
+            for item in normalized_items:
+                if (
+                    str(item.get("pk") or "")
+                    == requested_story_pk
+                ):
+                    selected_raw = item
+                    break
+
+        if selected_raw is None:
+            selected_raw = normalized_items[0]
+
+    if selected_raw:
+        media_url = selected_raw.get("url")
+        audio_url = selected_raw.get("audio_url")
+
+    if not media_url:
+        info, error, detail, status_code = (
+            extract_instagram_story_info(url)
+        )
+
+        if error:
+            return jsonify({
+                "status": "error",
+                "error": error,
+            }), status_code
+
+        media_url, _ = choose_media(info)
+        audio_url = choose_audio(info)
 
     if (
         not media_url
@@ -1219,20 +2019,18 @@ def instagram_story_download():
         "instagram-story.mp4",
     )
 
-    cmd = [
+    input_args = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        "-threads",
-        "2",
         "-i",
         media_url,
     ]
 
     if audio_url:
-        cmd += [
+        input_args += [
             "-i",
             audio_url,
             "-map",
@@ -1241,14 +2039,14 @@ def instagram_story_download():
             "1:a:0",
         ]
     else:
-        cmd += [
+        input_args += [
             "-map",
             "0:v:0",
             "-map",
             "0:a:0?",
         ]
 
-    cmd += [
+    input_args += [
         "-c:v",
         "libx264",
         "-preset",
@@ -1276,7 +2074,7 @@ def instagram_story_download():
 
     try:
         result = subprocess.run(
-            cmd,
+            input_args,
             capture_output=True,
             text=True,
             timeout=180,
@@ -1423,12 +2221,24 @@ def instagram_normalize():
             "high",
             "-level",
             "4.1",
+            "-tag:v",
+            "avc1",
             "-threads",
             "2",
             "-c:a",
-            "copy",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ar",
+            "48000",
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             final_path,
         ]
     else:
@@ -1447,35 +2257,143 @@ def instagram_normalize():
             "high",
             "-level",
             "4.1",
+            "-tag:v",
+            "avc1",
             "-threads",
             "2",
             "-c:a",
             "aac",
             "-b:a",
             "96k",
+            "-ar",
+            "48000",
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             final_path,
         ]
 
+    # IG-FIX-31 VALIDATED STREAM COPY
+    # Copy only wins if the resulting MP4 passes compatibility checks.
+    copy_path = os.path.join(
+        temp_dir,
+        "instagram-video-copy.mp4",
+    )
+
+    copy_cmd = cmd[:cmd.index("-c:v")] + [
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        copy_path,
+    ]
+
+    copy_succeeded = False
+
     try:
-        result = subprocess.run(
-            cmd,
+        copy_result = subprocess.run(
+            copy_cmd,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=12,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
-        )
 
-        return jsonify({
-            "status": "error",
-            "error": "instagram_normalize_timeout",
-        }), 504
+        if (
+            copy_result.returncode == 0
+            and os.path.isfile(copy_path)
+            and os.path.getsize(copy_path) > 0
+        ):
+            copy_probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries",
+                    "stream=codec_type,codec_name,pix_fmt",
+                    "-of", "json",
+                    copy_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+
+            if copy_probe.returncode == 0:
+                copy_streams = json.loads(
+                    copy_probe.stdout or "{}"
+                ).get("streams", [])
+
+                copy_videos = [
+                    stream for stream in copy_streams
+                    if stream.get("codec_type") == "video"
+                ]
+                copy_audios = [
+                    stream for stream in copy_streams
+                    if stream.get("codec_type") == "audio"
+                ]
+
+                copy_succeeded = (
+                    len(copy_videos) == 1
+                    and copy_videos[0].get("codec_name") == "h264"
+                    and copy_videos[0].get("pix_fmt") == "yuv420p"
+                    and all(
+                        stream.get("codec_name") == "aac"
+                        for stream in copy_audios
+                    )
+                    and (
+                        not audio_url
+                        or len(copy_audios) >= 1
+                    )
+                )
+
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        ValueError,
+    ):
+        copy_succeeded = False
+
+    if copy_succeeded:
+        os.replace(copy_path, final_path)
+    else:
+        try:
+            os.remove(copy_path)
+        except FileNotFoundError:
+            pass
+
+    app.logger.info(
+        "Instagram normalize mode: %s",
+        "stream-copy" if copy_succeeded else "transcode",
+    )
+
+    if copy_succeeded:
+        result = subprocess.CompletedProcess(cmd, 0)
+    else:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=240,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
+
+            return jsonify({
+                "status": "error",
+                "error": "instagram_normalize_timeout",
+            }), 504
 
     if (
         result.returncode != 0
@@ -1490,6 +2408,69 @@ def instagram_normalize():
         return jsonify({
             "status": "error",
             "error": "instagram_normalize_failed",
+        }), 422
+
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,pix_fmt",
+                "-of",
+                "json",
+                final_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+        streams = json.loads(
+            probe.stdout or "{}"
+        ).get("streams", [])
+    except (
+        subprocess.TimeoutExpired,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        streams = []
+        probe = None
+
+    video_streams = [
+        stream for stream in streams
+        if stream.get("codec_type") == "video"
+    ]
+
+    audio_streams = [
+        stream for stream in streams
+        if stream.get("codec_type") == "audio"
+    ]
+
+    compatible = (
+        probe is not None
+        and probe.returncode == 0
+        and len(video_streams) == 1
+        and video_streams[0].get("codec_name") == "h264"
+        and video_streams[0].get("pix_fmt") == "yuv420p"
+        and all(
+            stream.get("codec_name") == "aac"
+            for stream in audio_streams
+        )
+    )
+
+    if not compatible:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "instagram_normalize_incompatible",
         }), 422
 
     file_size = os.path.getsize(final_path)
@@ -1637,9 +2618,18 @@ def instagram_normalize():
         direct_passthrough=True,
     )
 
-    response.headers["Content-Length"] = str(
-        content_length
-    )
+    # IG-FIX-39: Preserve Content-Length for small responses.
+    # Larger responses must stream without a fixed body length.
+    # Gunicorn can then use HTTP/1.1 chunked transfer.
+    if content_length <= 32 * 1024 * 1024:
+        response.headers["Content-Length"] = str(
+            content_length
+        )
+    else:
+        app.logger.info(
+            "Instagram normalize: large MP4 streaming (%s bytes)",
+            content_length,
+        )
 
     response.headers["Accept-Ranges"] = "bytes"
 
@@ -1658,11 +2648,7 @@ def instagram_normalize():
 
     response.headers[
         "X-Monceda-Instagram"
-    ] = (
-        "h264-aac-fast-compatible"
-        if fast_remux
-        else "h264-range-compatible"
-    )
+    ] = "h264-aac-quicktime-compatible"
 
     return response
 
