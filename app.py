@@ -2653,6 +2653,49 @@ def instagram_normalize():
     return response
 
 
+def public_instagram_photos(path):
+    """Recover a complete photo post from its anonymous public embed."""
+    import requests
+
+    shortcode = path.strip("/").split("/")[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", shortcode):
+        return None
+
+    try:
+        response = requests.get(
+            f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
+            timeout=8,
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return None
+        match = re.search(r'"contextJSON"\s*:\s*', response.text)
+        if not match:
+            return None
+        encoded, _ = json.JSONDecoder().raw_decode(response.text[match.end():])
+        context = json.loads(encoded)
+        post = context["gql_data"]["shortcode_media"]
+        if post["shortcode"] != shortcode or context["context"].get("copyright_blocked"):
+            return None
+        edges = post.get("edge_sidecar_to_children", {}).get("edges")
+        nodes = [post] if edges is None else [edge["node"] for edge in edges]
+        entries = []
+        for node in nodes:
+            if node.get("is_video") is not False:
+                return None
+            url = node["display_url"]
+            if not is_instagram_media_url(url):
+                return None
+            ext = urlparse(url).path.rsplit(".", 1)[-1].lower()
+            if ext not in {"jpg", "jpeg", "png", "webp", "avif"}:
+                return None
+            entries.append({"id": node["id"], "url": url, "ext": ext})
+        if entries:
+            return {"id": post["id"], "entries": entries}
+    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 @app.post("/extract")
 def extract():
     data = request.get_json(silent=True) or {}
@@ -2753,19 +2796,23 @@ def extract():
             "error": "extract_timeout",
         }), 504
 
+    engine = "yt-dlp"
     if result.returncode != 0:
-        return jsonify({
-            "status": "error",
-            "error": "extract_failed",
-        }), 422
-
-    try:
-        info = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return jsonify({
-            "status": "error",
-            "error": "invalid_extractor_response",
-        }), 502
+        info = public_instagram_photos(request_path) if is_instagram_post else None
+        if not info:
+            return jsonify({
+                "status": "error",
+                "error": "extract_failed",
+            }), 422
+        engine = "instagram-public-embed"
+    else:
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return jsonify({
+                "status": "error",
+                "error": "invalid_extractor_response",
+            }), 502
 
     media_url, ext = choose_media(info)
 
@@ -2916,7 +2963,7 @@ def extract():
 
     response = {
         "status": "ok",
-        "engine": "yt-dlp",
+        "engine": engine,
         "id": media_id,
         "ext": ext,
         "filename": f"{host.replace('.', '_')}_{media_id}.{ext}",
