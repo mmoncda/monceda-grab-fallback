@@ -2144,6 +2144,7 @@ def instagram_normalize():
     ).strip()
 
     fast_remux = data.get("fast_remux") is True
+    facebook_reel = data.get("facebook_reel") is True
 
     if not is_instagram_media_url(media_url):
         return jsonify({
@@ -2207,7 +2208,15 @@ def instagram_normalize():
             "0:a:0?",
         ]
 
-    if fast_remux:
+    if facebook_reel:
+        cmd += [
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264", "-threads", "2", "-preset", "fast",
+            "-crf", "19", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "160k",
+            "-movflags", "+faststart", "-f", "mp4", final_path,
+        ]
+    elif fast_remux:
         cmd += [
             "-c:v",
             "libx264",
@@ -2297,7 +2306,7 @@ def instagram_normalize():
     copy_succeeded = False
 
     try:
-        copy_result = subprocess.run(
+        copy_result = None if facebook_reel else subprocess.run(
             copy_cmd,
             capture_output=True,
             text=True,
@@ -2306,7 +2315,8 @@ def instagram_normalize():
         )
 
         if (
-            copy_result.returncode == 0
+            copy_result is not None
+            and copy_result.returncode == 0
             and os.path.isfile(copy_path)
             and os.path.getsize(copy_path) > 0
         ):
@@ -2725,7 +2735,13 @@ def extract():
         "bilibili.tv",
     }
 
-    if host not in supported_hosts:
+    parsed = urlparse(url)
+    is_facebook_reel = (
+        parsed.scheme == "https"
+        and parsed.netloc.lower() in {"facebook.com", "www.facebook.com", "m.facebook.com"}
+        and re.fullmatch(r"/reel/\d+/?", parsed.path) is not None
+    )
+    if host not in supported_hosts and not is_facebook_reel:
         return jsonify({
             "status": "error",
             "error": "unsupported_host",
@@ -2815,6 +2831,15 @@ def extract():
             }), 502
 
     media_url, ext = choose_media(info)
+
+    if is_facebook_reel:
+        selected = info.get("requested_formats") or [info]
+        video = next((item for item in selected
+                      if item.get("vcodec") not in (None, "none")
+                      and is_instagram_media_url(item.get("url"))), None)
+        if not video:
+            return jsonify({"status": "error", "error": "no_video"}), 422
+        media_url, ext = video["url"], "mp4"
 
     media_id = str(info.get("id") or "media")
 
@@ -2957,7 +2982,7 @@ def extract():
 
     audio_url = (
         choose_audio(info)
-        if host == "instagram.com"
+        if host == "instagram.com" or (is_facebook_reel and video.get("acodec") in (None, "none"))
         else None
     )
 
